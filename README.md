@@ -22,12 +22,12 @@
    - Polls newly crawled untagged torrents (`torrentContent.search`) and batch-fetches their file trees in a single `torrent.files` query.
    - Runs a single vectorized Armiger batch inference pass (`0.21 ms/item` GPU or `2.44 ms/item` CPU INT8).
    - Prunes disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`), safety-gate violations, and fake-seeder honeypot traps in one batched `torrent.delete(infoHashes: $infoHashes)` mutation.
-   - Groups surviving torrents that share the same tag set (`armiger:<category>`, `armiger:lang:<lang>`, `armiger:viability:<tier>`, `armiger:anime`, `armiger:eng_subs`) into minimal batched `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)` mutations.
+   - Groups surviving torrents that share the same tag set (`armiger-<category>`, `armiger-lang-<lang>`, `armiger-viability-<tier>`, `armiger-anime`, `armiger-eng-subs`) into minimal batched `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)` mutations.
 
 2. **[`rats-search/` (`rats-search/rats_search_connector.py`)](rats-search/README.md)** — Connects to stock upstream [`librats/rats-search`](https://github.com/librats/rats-search) (`v2.3.5+`) via its built-in REST API (`:8095`), WebSocket push stream (`:8096`), and local Manticore RT index (`127.0.0.1:9306`):
    - Polls `/api/search.recent` or processes WebSocket `torrentIndexed` / `filesReady` events, enriching multi-file items via `/api/torrent.get?hash=<hash>&files=true`.
    - Purges disguised malware lures (`.mkv.exe`, `.scr`, `.lnk`), safety violations, and honeypot traps via `GET /api/torrent.remove?hashes=[...]` so `TorrentRepository`'s in-memory `Statistics` counters stay synchronized.
-   - Activates `rats-search`'s 9 granular `ContentCategory` IDs (`Movie=1`, `Series=2`, `Documentary=3`, `Anime=4`, `Music=5`, `Ebook=6`, `Comics=7`, `Software=8`, `Game=9`) and `XXX=100` in the Manticore `torrents` RT table using `rats-search`'s deterministic 63-bit `rowIdFromHash` docid lookup (`O(1)`) with collision verification.
+   - Activates `rats-search`'s 9 granular `ContentCategory` IDs (`Movie=1`, `Series=2`, `Documentary=3`, `Anime=4`, `Music=5`, `Ebook=6`, `Comics=7`, `Software=8`, `Game=9`) and `XXX=100` in the Manticore `torrents` RT table using `rats-search`'s deterministic 63-bit `rowIdFromHash` docid lookup (`O(1)`) with collision verification over a built-in pure-Python `mysql41` wire client.
 
 ---
 

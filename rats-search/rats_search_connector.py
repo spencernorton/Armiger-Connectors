@@ -10,11 +10,12 @@ and embedded Manticore RT index (`127.0.0.1:9306`):
      or `ArmigerUltraPipeline`).
   3. Purges disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`),
      safety-gate violations, and fake-seeder honeypot traps via
-     `GET /api/torrent.remove?hashes=[...]` so `TorrentRepository`'s in-memory
-     statistics stay synchronized.
+     `/api/torrent.remove` so `TorrentRepository`'s in-memory statistics stay
+     synchronized.
   4. Populates `rats-search`'s `contentType` and `contentCategory` (`Movie=1` ..
      `Game=9`, `XXX=100`) columns in the Manticore `torrents` RT table using
-     `rats-search`'s deterministic 63-bit `rowIdFromHash` docid lookup (`O(1)`).
+     `rats-search`'s deterministic 63-bit `rowIdFromHash` docid lookup (`O(1)`)
+     over a zero-dependency pure-Python `mysql41` wire-protocol client.
 """
 from __future__ import annotations
 
@@ -25,10 +26,13 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import struct
 import subprocess
 import sys
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -103,11 +107,11 @@ def map_to_rats_enums(pred: Mapping[str, Any], name: str = "") -> Tuple[RatsCont
 
     if category == "xxx" or adult == "adult":
         return (RatsContentType.BAD, RatsContentCategory.XXX)
+    if _DOCU_CUE_RE.search(name) and category in {"movie", "tv_show"}:
+        return (RatsContentType.VIDEO, RatsContentCategory.DOCUMENTARY)
     if anime == "anime" and category in {"movie", "tv_show"}:
         return (RatsContentType.VIDEO, RatsContentCategory.ANIME)
     if category == "movie":
-        if _DOCU_CUE_RE.search(name):
-            return (RatsContentType.VIDEO, RatsContentCategory.DOCUMENTARY)
         return (RatsContentType.VIDEO, RatsContentCategory.MOVIE)
     if category == "tv_show":
         return (RatsContentType.VIDEO, RatsContentCategory.SERIES)
@@ -122,6 +126,98 @@ def map_to_rats_enums(pred: Mapping[str, Any], name: str = "") -> Tuple[RatsCont
     if category == "game":
         return (RatsContentType.GAMES, RatsContentCategory.GAME)
     return (RatsContentType.UNKNOWN, RatsContentCategory.UNKNOWN)
+
+
+def _read_mysql_packet(sock: socket.socket) -> Tuple[int, bytes]:
+    hdr = b""
+    while len(hdr) < 4:
+        chunk = sock.recv(4 - len(hdr))
+        if not chunk:
+            raise EOFError("Unexpected EOF reading Manticore mysql41 packet header")
+        hdr += chunk
+    length = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
+    seq = hdr[3]
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
+            raise EOFError("Unexpected EOF reading Manticore mysql41 packet payload")
+        payload += chunk
+    return seq, payload
+
+
+def _write_mysql_packet(sock: socket.socket, seq: int, payload: bytes) -> None:
+    length = len(payload)
+    hdr = bytes([length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF, seq & 0xFF])
+    sock.sendall(hdr + payload)
+
+
+def _read_lenenc_int(buf: bytes, offset: int) -> Tuple[Optional[int], int]:
+    first = buf[offset]
+    offset += 1
+    if first < 0xFB:
+        return first, offset
+    if first == 0xFC:
+        return struct.unpack_from("<H", buf, offset)[0], offset + 2
+    if first == 0xFD:
+        return buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16), offset + 3
+    if first == 0xFE:
+        return struct.unpack_from("<Q", buf, offset)[0], offset + 8
+    return None, offset
+
+
+def _read_lenenc_str(buf: bytes, offset: int) -> Tuple[Optional[str], int]:
+    length, offset = _read_lenenc_int(buf, offset)
+    if length is None:
+        return None, offset
+    return buf[offset:offset + length].decode("utf-8", errors="replace"), offset + length
+
+
+def execute_manticore_mysql41(host: str, port: int, sql: str, timeout: float = 5.0) -> List[Dict[str, Any]]:
+    """Execute a SQL statement against Manticore `searchd` (`listen = ...:mysql41`) using pure Python stdlib."""
+    with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+        seq, _greeting = _read_mysql_packet(sock)
+        # HandshakeResponse41: CLIENT_PROTOCOL_41 (0x200) | CLIENT_SECURE_CONNECTION (0x8000)
+        handshake = struct.pack("<IIb23s", 0x00008200, 16777216, 33, b"\x00" * 23) + b"root\x00\x00"
+        _write_mysql_packet(sock, seq + 1, handshake)
+        _, auth_reply = _read_mysql_packet(sock)
+        if auth_reply and auth_reply[0] == 0xFF:
+            raise RuntimeError(f"Manticore mysql41 handshake error: {auth_reply[9:].decode('utf-8', 'replace')}")
+
+        # COM_QUERY (0x03)
+        _write_mysql_packet(sock, 0, b"\x03" + sql.encode("utf-8"))
+        _, first_pkt = _read_mysql_packet(sock)
+        if not first_pkt or first_pkt[0] == 0x00:
+            return []
+        if first_pkt[0] == 0xFF:
+            raise RuntimeError(f"Manticore SQL error: {first_pkt[9:].decode('utf-8', 'replace')}")
+
+        num_cols, _ = _read_lenenc_int(first_pkt, 0)
+        col_names: List[str] = []
+        for _ in range(num_cols or 0):
+            _, col_pkt = _read_mysql_packet(sock)
+            off = 0
+            for _ in range(4):  # catalog, schema, table, org_table
+                _, off = _read_lenenc_str(col_pkt, off)
+            col_name, off = _read_lenenc_str(col_pkt, off)
+            col_names.append(col_name or "")
+
+        _read_mysql_packet(sock)  # EOF packet after columns
+
+        rows: List[Dict[str, Any]] = []
+        while True:
+            _, row_pkt = _read_mysql_packet(sock)
+            if (row_pkt[0] == 0xFE and len(row_pkt) < 9) or (row_pkt[0] == 0x00 and len(row_pkt) > 5):
+                break
+            if row_pkt[0] == 0xFF:
+                raise RuntimeError(f"Manticore row error: {row_pkt[9:].decode('utf-8', 'replace')}")
+            off = 0
+            row_dict: Dict[str, Any] = {}
+            for col_name in col_names:
+                val, off = _read_lenenc_str(row_pkt, off)
+                row_dict[col_name] = val
+            rows.append(row_dict)
+        return rows
 
 
 class RatsSearchConnector:
@@ -156,11 +252,27 @@ class RatsSearchConnector:
     @staticmethod
     def _default_http_get_json(url: str, timeout: float = 10.0) -> Any:
         req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        if isinstance(payload, Mapping) and "data" in payload:
-            return payload["data"]
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                err_payload = json.loads(exc.read().decode("utf-8"))
+                if isinstance(err_payload, Mapping) and err_payload.get("success") is False:
+                    return None
+            except Exception:
+                pass
+            raise
+        if isinstance(payload, Mapping):
+            if payload.get("success") is False:
+                return None
+            if "data" in payload:
+                return payload["data"]
         return payload
+
+    def default_mysql41_executor(self, sql: str) -> List[Dict[str, Any]]:
+        """Execute a Manticore SQL query over the built-in pure-Python `mysql41` wire client."""
+        return execute_manticore_mysql41(self.manticore_host, self.manticore_port, sql)
 
     def default_mysql_cli_executor(self, sql: str) -> List[Dict[str, Any]]:
         """Execute a Manticore SQL query via local `mysql` client against `127.0.0.1:9306`."""
@@ -207,7 +319,7 @@ class RatsSearchConnector:
         infohash = str(item.get("hash") or item.get("infoHash") or item.get("infohash") or "").strip().lower()
         name = str(item.get("name") or item.get("title") or "")
         size = int(item.get("size") or 0)
-        raw_files = item.get("fileList") or item.get("filesList") or item.get("files_list")
+        raw_files = item.get("files_list") or item.get("filesList") or item.get("fileList")
         if not isinstance(raw_files, list):
             raw_files = item.get("files") if isinstance(item.get("files"), list) else []
         files = [
@@ -282,10 +394,10 @@ class RatsSearchConnector:
 
             if self.prune_malware_and_honeypots and (is_unsafe or is_honeypot):
                 reason = (
-                    "csam_or_safety_gate"
-                    if not pred["csam_safe"]
-                    else "disguised_executable"
+                    "disguised_executable"
                     if pred["disguised_executable"]
+                    else "csam_or_safety_gate"
+                    if not pred["csam_safe"]
                     else "honeypot_trap"
                     if is_honeypot
                     else "junk_or_sample"
@@ -399,15 +511,22 @@ class RatsSearchConnector:
             ih = str(item.get("hash") or "").strip().lower()
             if not _HEX40_RE.match(ih) or ih in self._seen:
                 continue
-            # Skip items that already have a populated rats-search ContentCategory (1..9 or 100)
-            if int(item.get("contentCategory") or 0) != 0:
+            # Skip items that already have a populated rats-search ContentCategory
+            # (`""` or `0` in `torrent_codec.cpp` / Manticore means Unknown)
+            raw_cat = item.get("contentCategory")
+            if raw_cat is None:
+                raw_cat = item.get("contentcategory")
+            if raw_cat not in (None, "", 0, "0", "unknown"):
                 self._mark_seen(ih)
                 continue
             enriched = dict(item)
-            if enrich_files and int(item.get("files") or 0) > 0 and not isinstance(item.get("fileList"), list):
+            existing_files = item.get("files_list") or item.get("filesList") or item.get("fileList")
+            if enrich_files and int(item.get("files") or 0) > 0 and not isinstance(existing_files, list):
                 detail = self._http_get_json(f"{self.rest_base_url}/api/torrent.get?hash={ih}&files=true")
-                if isinstance(detail, Mapping) and isinstance(detail.get("fileList"), list):
-                    enriched["fileList"] = detail["fileList"]
+                if isinstance(detail, Mapping):
+                    fetched_files = detail.get("files_list") or detail.get("filesList") or detail.get("fileList")
+                    if isinstance(fetched_files, list):
+                        enriched["files_list"] = fetched_files
             candidates.append(enriched)
 
         evaluation = self.evaluate_batch(candidates)
@@ -430,7 +549,12 @@ class RatsSearchConnector:
             return None
 
         detail = self._http_get_json(f"{self.rest_base_url}/api/torrent.get?hash={ih}&files=true")
-        item = detail if isinstance(detail, Mapping) and detail.get("hash") else data
+        if isinstance(detail, Mapping) and detail.get("hash"):
+            item: Dict[str, Any] = dict(detail)
+        else:
+            item = dict(data)
+        if event_name == "filesReady" and isinstance(data.get("files"), list):
+            item["files_list"] = data["files"]
         evaluation = self.evaluate_batch([item])
         if apply_changes:
             evaluation["applied"] = self.apply_results(evaluation)
@@ -496,7 +620,7 @@ def main() -> None:
         prune_adult=os.environ.get("ARMIGER_PRUNE_ADULT", "false").lower() == "true",
     )
     if enable_manticore_sql:
-        connector._sql_executor = connector.default_mysql_cli_executor
+        connector._sql_executor = connector.default_mysql41_executor
 
     if mode == "http":
         host = os.environ.get("ARMIGER_CONNECTOR_HOST", "127.0.0.1")

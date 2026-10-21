@@ -1,7 +1,9 @@
-"""Unit and HTTP integration tests for `Armiger-Connectors` (`bitmagnet` & `rats-search`)."""
+"""Unit and HTTP/wire-protocol integration tests for `Armiger-Connectors` (`bitmagnet` & `rats-search`)."""
 from __future__ import annotations
 
 import json
+import socket
+import struct
 import threading
 from typing import Any, Dict, List, Mapping, Sequence
 import urllib.request
@@ -10,12 +12,14 @@ from bitmagnet_connector import (
     BitmagnetConnector,
     create_server as create_bitmagnet_server,
     has_disguised_executable,
+    sanitize_bitmagnet_tag,
 )
 from rats_search_connector import (
     RatsContentCategory,
     RatsContentType,
     RatsSearchConnector,
     create_server as create_rats_server,
+    execute_manticore_mysql41,
     map_to_rats_enums,
     row_id_from_hash,
 )
@@ -84,7 +88,7 @@ class SyntheticArmigerClassifier:
 # 1. Stock Upstream Bitmagnet Connector Tests
 # =====================================================================
 
-def test_disguised_executable_detection() -> None:
+def test_disguised_executable_and_kebab_tag_sanitization() -> None:
     assert has_disguised_executable(
         "Sintel.2010.1080p.BluRay.x264",
         [{"path": "Sintel.2010.1080p.mkv.exe", "size": 2_400_000}],
@@ -100,6 +104,11 @@ def test_disguised_executable_detection() -> None:
         [{"path": "Sintel.2010.1080p.mkv", "size": 4_500_000_000}],
         "movie",
     ) is False
+
+    # Stock Bitmagnet enforces `^[a-z0-9]+(-[a-z0-9]+)*$` on `torrent_tags.name`
+    assert sanitize_bitmagnet_tag("armiger:tv_show") == "armiger-tv-show"
+    assert sanitize_bitmagnet_tag("armiger:lang:multi_or_unknown") == "armiger-lang-multi-or-unknown"
+    assert sanitize_bitmagnet_tag("armiger-viability-alive_viable") == "armiger-viability-alive-viable"
 
 
 def test_bitmagnet_evaluate_batch_groups_tags_and_prunes_malware() -> None:
@@ -142,7 +151,7 @@ def test_bitmagnet_evaluate_batch_groups_tags_and_prunes_malware() -> None:
     assert "delete(infoHashes: $infoHashes)" in del_mut["query"]
     assert del_mut["variables"] == {"infoHashes": ["3333333333333333333333333333333333333333"]}
 
-    # Both surviving movies share the exact same tag set, so they are grouped into 1 putTags mutation
+    # Both surviving movies share the exact same kebab-case tag set, so they are grouped into 1 putTags mutation
     assert len(res["graphqlPutTagsMutations"]) == 1
     tag_mut = res["graphqlPutTagsMutations"][0]
     assert "putTags(infoHashes: $infoHashes, tagNames: $tagNames)" in tag_mut["query"]
@@ -150,8 +159,9 @@ def test_bitmagnet_evaluate_batch_groups_tags_and_prunes_malware() -> None:
         "1111111111111111111111111111111111111111",
         "2222222222222222222222222222222222222222",
     ]
-    assert "armiger:movie" in tag_mut["variables"]["tagNames"]
-    assert "armiger:lang:english" in tag_mut["variables"]["tagNames"]
+    assert "armiger-movie" in tag_mut["variables"]["tagNames"]
+    assert "armiger-lang-english" in tag_mut["variables"]["tagNames"]
+    assert "armiger-viability-alive-viable" in tag_mut["variables"]["tagNames"]
 
 
 def test_bitmagnet_sync_once_fetches_files_and_skips_already_tagged() -> None:
@@ -180,7 +190,7 @@ def test_bitmagnet_sync_once_fetches_files_and_skips_already_tagged() -> None:
                                         "hasFilesInfo": True,
                                         "seeders": 10,
                                         "leechers": 1,
-                                        "tagNames": ["armiger:movie"],
+                                        "tagNames": ["armiger-movie"],
                                     },
                                 },
                                 {
@@ -287,8 +297,8 @@ def test_rats_enum_mapping_covers_all_categories() -> None:
         RatsContentCategory.MOVIE,
     )
     assert map_to_rats_enums(
-        {"category": "movie", "adult": "non_adult", "anime": "non_anime"},
-        "Planet.Open.Documentary.2022.1080p",
+        {"category": "movie", "adult": "non_adult", "anime": "anime"},
+        "Sintel.Documentary.Behind.The.Scenes.2010.BBC.1080p",
     ) == (
         RatsContentType.VIDEO,
         RatsContentCategory.DOCUMENTARY,
@@ -334,21 +344,25 @@ def test_rats_sync_recent_and_collision_safe_manticore_updates() -> None:
     h_movie = "1000000000000000111111111111111111111111"
     h_malware = "2000000000000000222222222222222222222222"
     h_collided = "3000000000000000333333333333333333333333"
+    h_already = "4000000000000000444444444444444444444444"
 
     def fake_http_get(url: str) -> Any:
         rest_calls.append(url)
         if "/api/search.recent" in url:
             return [
-                {"hash": h_movie, "name": "Sintel.2010.1080p", "size": 4_000_000_000, "files": 1, "contentCategory": 0, "seeders": 25},
-                {"hash": h_malware, "name": "Fake.Movie.2024.1080p", "size": 12_000_000, "files": 1, "contentCategory": 0, "seeders": 80},
-                {"hash": h_collided, "name": "Caminandes.S01E01.1080p", "size": 800_000_000, "files": 1, "contentCategory": 0, "seeders": 15},
+                # String contentCategory="" matches `src/domain/torrent_codec.cpp` when Unknown
+                {"hash": h_movie, "name": "Sintel.2010.1080p", "size": 4_000_000_000, "files": 1, "contentCategory": "", "seeders": 25},
+                {"hash": h_malware, "name": "Fake.Movie.2024.1080p", "size": 12_000_000, "files": 1, "contentCategory": "", "seeders": 80},
+                {"hash": h_collided, "name": "Caminandes.S01E01.1080p", "size": 800_000_000, "files": 1, "contentCategory": "", "seeders": 15},
+                # Already classified as "movie" in `torrent_codec.cpp` -> must be skipped without ValueError!
+                {"hash": h_already, "name": "Already.Classified.2020.1080p", "size": 900_000_000, "files": 1, "contentCategory": "movie", "seeders": 10},
             ]
         if f"hash={h_movie}" in url:
-            return {"hash": h_movie, "fileList": [{"path": "Sintel.2010.1080p.mkv", "size": 4_000_000_000}]}
+            return {"hash": h_movie, "files_list": [{"path": "Sintel.2010.1080p.mkv", "size": 4_000_000_000}]}
         if f"hash={h_malware}" in url:
-            return {"hash": h_malware, "fileList": [{"path": "Fake.Movie.2024.1080p.mkv.exe", "size": 12_000_000}]}
+            return {"hash": h_malware, "files_list": [{"path": "Fake.Movie.2024.1080p.mkv.exe", "size": 12_000_000}]}
         if f"hash={h_collided}" in url:
-            return {"hash": h_collided, "fileList": [{"path": "Caminandes.S01E01.1080p.mkv", "size": 800_000_000}]}
+            return None  # Simulate HTTP 400 / not found on collided slot
         return {"removed": True}
 
     def fake_sql_executor(sql: str) -> List[Dict[str, Any]]:
@@ -380,6 +394,57 @@ def test_rats_sync_recent_and_collision_safe_manticore_updates() -> None:
     )
 
 
+def test_pure_python_mysql41_wire_protocol_client() -> None:
+    """Verify `execute_manticore_mysql41` against a local TCP socket speaking MySQL 4.1 wire protocol."""
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv_sock.bind(("127.0.0.1", 0))
+    srv_sock.listen(1)
+    port = srv_sock.getsockname()[1]
+
+    def _pkt(seq: int, payload: bytes) -> bytes:
+        n = len(payload)
+        return bytes([n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF, seq & 0xFF]) + payload
+
+    def _lenstr(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return bytes([len(b)]) + b
+
+    def server_worker() -> None:
+        conn, _ = srv_sock.accept()
+        with conn:
+            # 1. Send greeting packet (seq=0)
+            conn.sendall(_pkt(0, b"\x0a5.0.0-manticore\x00" + b"\x00" * 30))
+            # 2. Read handshake response
+            conn.recv(1024)
+            # 3. Send OK packet (seq=2)
+            conn.sendall(_pkt(2, b"\x00\x00\x00\x02\x00\x00\x00"))
+            # 4. Read COM_QUERY
+            conn.recv(1024)
+            # 5. Send 1-column result set for `SELECT hash FROM torrents`
+            conn.sendall(_pkt(1, b"\x01"))
+            col_def = (
+                _lenstr("def")
+                + _lenstr("")
+                + _lenstr("torrents")
+                + _lenstr("torrents")
+                + _lenstr("hash")
+                + _lenstr("hash")
+                + b"\x0c\x21\x00\xff\x00\x00\x00\xfd\x00\x00\x00\x00\x00"
+            )
+            conn.sendall(_pkt(2, col_def))
+            conn.sendall(_pkt(3, b"\xfe\x00\x00\x02\x00"))
+            conn.sendall(_pkt(4, _lenstr("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4")))
+            conn.sendall(_pkt(5, b"\xfe\x00\x00\x02\x00"))
+
+    th = threading.Thread(target=server_worker, daemon=True)
+    th.start()
+    try:
+        rows = execute_manticore_mysql41("127.0.0.1", port, "SELECT hash FROM torrents WHERE id = 1 LIMIT 1")
+        assert rows == [{"hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"}]
+    finally:
+        srv_sock.close()
+
+
 def test_rats_websocket_event_handler_and_http_server() -> None:
     h_anime = "4000000000000000444444444444444444444444"
 
@@ -390,7 +455,7 @@ def test_rats_websocket_event_handler_and_http_server() -> None:
             "size": 950_000_000,
             "files": 1,
             "seeders": 40,
-            "fileList": [{"path": "Open.Anime.Series.S01E02.mkv", "size": 950_000_000}],
+            "files_list": [{"path": "Open.Anime.Series.S01E02.mkv", "size": 950_000_000}],
         }
 
     connector = RatsSearchConnector(SyntheticArmigerClassifier(), http_get_json=fake_http_get)
