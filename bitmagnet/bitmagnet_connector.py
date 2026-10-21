@@ -4,16 +4,16 @@
 Works with unmodified `bitmagnet-io/bitmagnet` via its standard GraphQL API
 (`http://localhost:3333/graphql`):
   1. Queries newly indexed torrents (`torrentContent.search`) and skips items
-     that already carry an `armiger:*` tag.
+     that already carry an `armiger-*` tag.
   2. Batch-fetches inner file lists in a single `torrent.files` GraphQL call.
   3. Runs a single vectorized Armiger batch inference pass (`ArmigerONNXClassifier`
      or `ArmigerUltraPipeline`).
   4. Prunes disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`),
      safety-gate failures, and fake-seeder honeypot traps in one batched
      `torrent.delete(infoHashes: $infoHashes)` mutation.
-  5. Enriches surviving torrents by grouping hashes that share the same tag set
-     into minimal batched `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)`
-     mutations.
+  5. Enriches surviving torrents by grouping hashes that share the same kebab-case
+     tag set (`^[a-z0-9]+(-[a-z0-9]+)*$`) into minimal batched
+     `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)` mutations.
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ _DISGUISED_EXEC_RE = re.compile(
     re.IGNORECASE,
 )
 _STANDALONE_LURE_RE = re.compile(r"\.(?:scr|hta|pif|vbs|lnk)$", re.IGNORECASE)
+_NON_KEBAB_RE = re.compile(r"[^a-z0-9]+")
 
 GRAPHQL_RECENT_TORRENTS_QUERY = """
 query ArmigerRecentTorrents($input: TorrentContentSearchQueryInput!) {
@@ -104,6 +105,11 @@ mutation TorrentPutTags($infoHashes: [Hash20!]!, $tagNames: [String!]!) {
   }
 }
 """.strip()
+
+
+def sanitize_bitmagnet_tag(tag: str) -> str:
+    """Normalize a tag into stock Bitmagnet's required kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`)."""
+    return _NON_KEBAB_RE.sub("-", str(tag or "").strip().lower()).strip("-")
 
 
 def load_armiger_classifier(model_dir: str | Path, variant: str = "int8") -> Any:
@@ -233,7 +239,10 @@ class BitmagnetConnector:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            parsed = json.loads(resp.read().decode("utf-8"))
+        if isinstance(parsed, Mapping) and parsed.get("errors"):
+            raise RuntimeError(f"Bitmagnet GraphQL error: {parsed['errors']}")
+        return parsed
 
     def _mark_seen(self, infohash: str) -> None:
         if not infohash:
@@ -312,14 +321,18 @@ class BitmagnetConnector:
     def build_put_tags_mutation(infohashes: Sequence[str], tag_names: Sequence[str]) -> Optional[Dict[str, Any]]:
         """Build stock Bitmagnet `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)` payload."""
         clean_hashes = [h.strip().lower() for h in infohashes if h and h.strip()]
-        clean_tags = [t.strip() for t in tag_names if t and t.strip()]
+        clean_tags = [
+            sanitized
+            for t in tag_names
+            if t and (sanitized := sanitize_bitmagnet_tag(t))
+        ]
         if not clean_hashes or not clean_tags:
             return None
         return {
             "query": GRAPHQL_PUT_TAGS_MUTATION,
             "variables": {
                 "infoHashes": clean_hashes,
-                "tagNames": clean_tags,
+                "tagNames": list(dict.fromkeys(clean_tags)),
             },
         }
 
@@ -344,10 +357,10 @@ class BitmagnetConnector:
 
             if self.prune_malware_and_honeypots and (is_unsafe or is_honeypot):
                 reason = (
-                    "csam_or_safety_gate"
-                    if not pred["csam_safe"]
-                    else "disguised_executable"
+                    "disguised_executable"
                     if pred["disguised_executable"]
+                    else "csam_or_safety_gate"
+                    if not pred["csam_safe"]
                     else "honeypot_trap"
                     if is_honeypot
                     else "junk_or_sample"
@@ -381,19 +394,20 @@ class BitmagnetConnector:
             else:
                 bitmagnet_type = BITMAGNET_CONTENT_TYPE_MAP.get(pred["category"])
 
-            tags = [
-                f"armiger:{pred['category']}",
-                f"armiger:lang:{pred['lang']}",
+            raw_tags = [
+                f"armiger-{pred['category']}",
+                f"armiger-lang-{pred['lang']}",
             ]
             if pred["viability_tier"] != "unknown":
-                tags.append(f"armiger:viability:{pred['viability_tier']}")
+                raw_tags.append(f"armiger-viability-{pred['viability_tier']}")
             if pred["anime"] == "anime":
-                tags.append("armiger:anime")
+                raw_tags.append("armiger-anime")
                 if pred.get("anime_dub_status"):
-                    tags.append(f"armiger:dub:{pred['anime_dub_status']}")
+                    raw_tags.append(f"armiger-dub-{pred['anime_dub_status']}")
             if pred["english_subs"] == "has_eng_subs":
-                tags.append("armiger:eng_subs")
+                raw_tags.append("armiger-eng-subs")
 
+            tags = [sanitize_bitmagnet_tag(t) for t in raw_tags if sanitize_bitmagnet_tag(t)]
             tag_key = tuple(dict.fromkeys(tags))
             if ih:
                 grouped_tags.setdefault(tag_key, []).append(ih)
@@ -452,7 +466,7 @@ class BitmagnetConnector:
             if not ih or ih in self._seen:
                 continue
             existing_tags = t_obj.get("tagNames") or []
-            if any(str(t).startswith("armiger:") for t in existing_tags):
+            if any(str(t).startswith(("armiger-", "armiger:")) for t in existing_tags):
                 self._mark_seen(ih)
                 continue
             untagged_items.append(item)
