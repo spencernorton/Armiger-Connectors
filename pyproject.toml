@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "armiger-connectors"
+version = "1.0.0"
+description = "Minimal, high-efficiency connectors integrating Armiger with stock upstream Bitmagnet and Rats Search."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "bitmagnet", "rats-search"]

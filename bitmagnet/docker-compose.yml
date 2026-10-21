@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bitmagnet-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: bitmagnet
+    volumes:
+      - bitmagnet_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bitmagnet:
+    image: ghcr.io/bitmagnet-io/bitmagnet:latest
+    container_name: bitmagnet
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3333:3333"
+      - "3334:3334/tcp"
+      - "3334:3334/udp"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+    command:
+      - worker
+      - run
+      - --keys=http_server
+      - --keys=queue_server
+      - --keys=dht_crawler
+
+  armiger-bitmagnet-connector:
+    image: python:3.11-slim
+    container_name: armiger-bitmagnet-connector
+    restart: unless-stopped
+    depends_on:
+      - bitmagnet
+    working_dir: /app
+    volumes:
+      - ./bitmagnet_connector.py:/app/bitmagnet_connector.py:ro
+      - ${ARMIGER_MODEL_DIR:-../armiger}:/models/armiger:ro
+    environment:
+      ARMIGER_MODEL_DIR: /models/armiger
+      ARMIGER_VARIANT: int8
+      BITMAGNET_GRAPHQL_URL: http://bitmagnet:3333/graphql
+      BITMAGNET_POLL_SECONDS: "5"
+      BITMAGNET_BATCH_SIZE: "100"
+      ARMIGER_PRUNE_MALWARE: "true"
+      ARMIGER_PRUNE_DEAD_SWARMS: "false"
+    command:
+      - /bin/sh
+      - -c
+      - "pip install --no-cache-dir numpy onnxruntime && python3 /app/bitmagnet_connector.py"
+
+volumes:
+  bitmagnet_pgdata:

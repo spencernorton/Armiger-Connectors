@@ -1,0 +1,26 @@
+services:
+  armiger-rats-connector:
+    image: python:3.11-slim
+    container_name: armiger-rats-connector
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    volumes:
+      - ../:/app:ro
+      - ${ARMIGER_MODEL_DIR:-../../armiger}:/models/armiger:ro
+    environment:
+      ARMIGER_MODEL_DIR: /models/armiger
+      ARMIGER_VARIANT: int8
+      RATS_REST_URL: http://127.0.0.1:8095
+      RATS_MANTICORE_HOST: 127.0.0.1
+      RATS_MANTICORE_PORT: "9306"
+      RATS_ENABLE_MANTICORE_SQL: "true"
+      RATS_POLL_SECONDS: "5"
+      RATS_BATCH_SIZE: "100"
+      ARMIGER_PRUNE_MALWARE: "true"
+      ARMIGER_PRUNE_DEAD_SWARMS: "false"
+      ARMIGER_PRUNE_ADULT: "false"
+    command:
+      - /bin/sh
+      - -c
+      - "apt-get update && apt-get install -y --no-install-recommends default-mysql-client && pip install --no-cache-dir numpy onnxruntime && python3 /app/rats-search/rats_search_connector.py"

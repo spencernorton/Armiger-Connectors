@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a classification, safety-gate, or plugin defect
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Concise description of the defect (use Creative Commons or synthetic metadata examples only).
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal Reproducer
+      description: Python snippet or synthetic metadata dictionary that reproduces the issue.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / Commit
+      placeholder: v2.1.0
+    validations:
+      required: true
