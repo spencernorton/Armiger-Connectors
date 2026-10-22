@@ -1,26 +1,59 @@
 services:
   armiger-rats-connector:
-    image: python:3.11-slim
+    image: python:3.12-slim
     container_name: armiger-rats-connector
     restart: unless-stopped
     network_mode: host
-    working_dir: /app
+    working_dir: /var/lib/armiger
     volumes:
-      - ../:/app:ro
-      - ${ARMIGER_MODEL_DIR:-../../armiger}:/models/armiger:ro
+      - armiger_data:/var/lib/armiger
     environment:
-      ARMIGER_MODEL_DIR: /models/armiger
-      ARMIGER_VARIANT: int8
-      RATS_REST_URL: http://127.0.0.1:8095
-      RATS_MANTICORE_HOST: 127.0.0.1
-      RATS_MANTICORE_PORT: "9306"
-      RATS_ENABLE_MANTICORE_SQL: "true"
-      RATS_POLL_SECONDS: "5"
-      RATS_BATCH_SIZE: "100"
-      ARMIGER_PRUNE_MALWARE: "true"
-      ARMIGER_PRUNE_DEAD_SWARMS: "false"
-      ARMIGER_PRUNE_ADULT: "false"
+      ARMIGER_MODEL_DIR: /var/lib/armiger/model
+      ARMIGER_HF_REPO: "${ARMIGER_HF_REPO:-NorviTech/armiger-ultra}"
+      ARMIGER_AUTO_DOWNLOAD: "${ARMIGER_AUTO_DOWNLOAD:-true}"
+      ARMIGER_VARIANT: "${ARMIGER_VARIANT:-ultra}"
+      ARMIGER_USE_ZERO_CUE_CATALOG: "${ARMIGER_USE_ZERO_CUE_CATALOG:-true}"
+      ARMIGER_CONNECTOR_MODE: "${ARMIGER_CONNECTOR_MODE:-both}"
+      ARMIGER_CONNECTOR_HOST: "127.0.0.1"
+      ARMIGER_CONNECTOR_PORT: "8097"
+      RATS_REST_URL: "${RATS_REST_URL:-http://127.0.0.1:8095}"
+      RATS_MANTICORE_HOST: "${RATS_MANTICORE_HOST:-127.0.0.1}"
+      RATS_MANTICORE_PORT: "${RATS_MANTICORE_PORT:-9306}"
+      RATS_ENABLE_MANTICORE_SQL: "${RATS_ENABLE_MANTICORE_SQL:-true}"
+      RATS_POLL_SECONDS: "${RATS_POLL_SECONDS:-5}"
+      RATS_BATCH_SIZE: "${RATS_BATCH_SIZE:-100}"
+      ARMIGER_PRUNE_MALWARE: "${ARMIGER_PRUNE_MALWARE:-true}"
+      ARMIGER_PRUNE_DEAD_SWARMS: "${ARMIGER_PRUNE_DEAD_SWARMS:-false}"
+      ARMIGER_PRUNE_ADULT: "${ARMIGER_PRUNE_ADULT:-false}"
     command:
       - /bin/sh
       - -c
-      - "apt-get update && apt-get install -y --no-install-recommends default-mysql-client && pip install --no-cache-dir numpy onnxruntime && python3 /app/rats-search/rats_search_connector.py"
+      - |
+        set -e
+        pip install --no-cache-dir --quiet numpy onnxruntime cryptography huggingface_hub
+        pip install --no-cache-dir --quiet --index-url https://download.pytorch.org/whl/cpu torch || true
+        python3 -c '
+        import os, urllib.request
+        from pathlib import Path
+        from huggingface_hub import snapshot_download
+        base = "https://raw.githubusercontent.com/spencernorton/Armiger-Connectors/main"
+        for sub, fn in (("bitmagnet", "bitmagnet_connector.py"), ("rats-search", "rats_search_connector.py")):
+            dst = Path("/var/lib/armiger") / sub / fn
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.is_file():
+                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(dst))
+        model_dir = Path(os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model"))
+        if not (model_dir / "armiger_onnx.py").is_file():
+            model_dir.mkdir(parents=True, exist_ok=True)
+            snapshot_download(repo_id=os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra"), local_dir=str(model_dir))
+        '
+        exec python3 /var/lib/armiger/rats-search/rats_search_connector.py
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8097/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+volumes:
+  armiger_data:

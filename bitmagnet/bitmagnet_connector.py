@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Minimal, high-efficiency Armiger connector for stock upstream Bitmagnet.
+"""Turnkey Armiger & Armiger Ultra connector for stock upstream Bitmagnet.
 
 Works with unmodified `bitmagnet-io/bitmagnet` via its standard GraphQL API
-(`http://localhost:3333/graphql`):
-  1. Queries newly indexed torrents (`torrentContent.search`) and skips items
+(`http://localhost:3333/graphql`) and Torznab feed (`http://localhost:3333/torznab`):
+  1. Auto-bootstraps `NorviTech/armiger-ultra` (`ArmigerUltraPipeline` 9-head RoPE
+     Transformer + 6 plugins) from Hugging Face when `ARMIGER_AUTO_DOWNLOAD=true`
+     and `ARMIGER_MODEL_DIR` is not yet populated.
+  2. Queries newly indexed torrents (`torrentContent.search`) and skips items
      that already carry an `armiger-*` tag.
-  2. Batch-fetches inner file lists in a single `torrent.files` GraphQL call.
-  3. Runs a single vectorized Armiger batch inference pass (`ArmigerONNXClassifier`
-     or `ArmigerUltraPipeline`).
-  4. Prunes disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`),
-     safety-gate failures, and fake-seeder honeypot traps in one batched
+  3. Batch-fetches inner file lists in a single `torrent.files` GraphQL call.
+  4. Runs a single vectorized Armiger Ultra batch inference pass (`ArmigerUltraPipeline`
+     or `ArmigerONNXClassifier`).
+  5. Prunes disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`),
+     CSAM/safety-gate failures, and fake-seeder honeypot traps in one batched
      `torrent.delete(infoHashes: $infoHashes)` mutation.
-  5. Enriches surviving torrents by grouping hashes that share the same kebab-case
+  6. Enriches surviving torrents by grouping hashes that share the same kebab-case
      tag set (`^[a-z0-9]+(-[a-z0-9]+)*$`) into minimal batched
      `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)` mutations.
+  7. Exposes `/healthz`, `POST /v1/bitmagnet/classify`, and a pre-grab Torznab XML
+     filtering proxy (`/torznab` on `:8096` and `:8097`) for Prowlarr / `*Arr`.
 """
 from __future__ import annotations
 
@@ -24,9 +29,15 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+
+TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
+ET.register_namespace("torznab", TORZNAB_NS)
 
 BITMAGNET_CONTENT_TYPE_MAP: Dict[str, Optional[str]] = {
     "movie": "movie",
@@ -112,15 +123,72 @@ def sanitize_bitmagnet_tag(tag: str) -> str:
     return _NON_KEBAB_RE.sub("-", str(tag or "").strip().lower()).strip("-")
 
 
-def load_armiger_classifier(model_dir: str | Path, variant: str = "int8") -> Any:
+def _has_armiger_artifacts(mpath: Path) -> bool:
+    has_ultra = (mpath / "armiger_ultra_pipeline.py").exists() and (
+        (mpath / "armiger_ultra.fp32.onnx").exists() or (mpath / "armiger.int8.onnx").exists()
+    )
+    has_base = (mpath / "armiger_inference.py").exists() and (
+        (mpath / "armiger.onnx").exists() or (mpath / "armiger.int8.onnx").exists()
+    )
+    return has_ultra or has_base
+
+
+def ensure_armiger_model_dir(
+    model_dir: str | Path,
+    *,
+    hf_repo: str = "NorviTech/armiger-ultra",
+    auto_download: bool = False,
+) -> Path:
+    """Resolve `model_dir` across local/sibling/cache paths and optionally bootstrap from Hugging Face."""
+    requested = Path(model_dir).expanduser().resolve()
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        requested,
+        Path.cwd().resolve(),
+        (repo_root.parent / "armiger").resolve(),
+        (Path.home() / ".cache" / "armiger-ultra").resolve(),
+    ]
+    for cand in candidates:
+        if _has_armiger_artifacts(cand):
+            return cand
+
+    if auto_download:
+        target = requested
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            target = (Path.home() / ".cache" / "armiger-ultra").resolve()
+            target.mkdir(parents=True, exist_ok=True)
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=hf_repo, local_dir=str(target))
+        return target
+    return requested
+
+
+def load_armiger_classifier(
+    model_dir: str | Path,
+    variant: str = "ultra",
+    *,
+    preload_catalog: Optional[bool] = None,
+    auto_download: bool = False,
+    hf_repo: Optional[str] = None,
+) -> Any:
     """Load `ArmigerUltraPipeline` if present in `model_dir`, else `ArmigerONNXClassifier`."""
-    mpath = Path(model_dir).resolve()
+    eff_repo = hf_repo or os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra")
+    mpath = ensure_armiger_model_dir(model_dir, hf_repo=eff_repo, auto_download=auto_download)
     if str(mpath) in sys.path:
         sys.path.remove(str(mpath))
     sys.path.insert(0, str(mpath))
+    if preload_catalog is None:
+        preload_catalog = os.environ.get("ARMIGER_USE_ZERO_CUE_CATALOG", "true").lower() == "true"
     if (mpath / "armiger_ultra_pipeline.py").exists():
         from armiger_ultra_pipeline import ArmigerUltraPipeline
-        return ArmigerUltraPipeline.from_directory(mpath, variant=variant, preload_catalog=False)
+        return ArmigerUltraPipeline.from_directory(
+            mpath,
+            variant=variant,
+            preload_catalog=preload_catalog,
+            rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE", "pull_only"),
+        )
     from armiger_inference import ArmigerONNXClassifier
     onnx_name = "armiger.onnx" if (mpath / "armiger.onnx").exists() else "armiger.int8.onnx"
     return ArmigerONNXClassifier(
@@ -165,11 +233,15 @@ def normalize_prediction(pred: Any, row: Mapping[str, Any]) -> Dict[str, Any]:
         anime = str(pred.get("anime") or _head_label(heads, "anime", "non_anime"))
         lang = str(pred.get("lang") or _head_label(heads, "lang", "multi_or_unknown"))
         eng_subs = str(pred.get("english_subs") or _head_label(heads, "english_subs", "unknown"))
+        title_lang = str(pred.get("title_language") or _head_label(heads, "title_language", "english_title"))
+        owner_scope = str(pred.get("owner_scope") or _head_label(heads, "owner_scope", "allowed_type"))
         gates = pred.get("mondrian_gates", {})
         csam_safe = bool(pred.get("csam_safety", {}).get("is_safe", True))
         honeypot = bool(pred.get("honeypot_trap", {}).get("is_honeypot_trap", False))
-        viability_tier = str(pred.get("swarm_viability", {}).get("viability_tier", "unknown"))
-        viability_prob = float(pred.get("swarm_viability", {}).get("viability_prob", 0.5))
+        sw_obj = pred.get("swarm_viability", {}) if isinstance(pred.get("swarm_viability"), Mapping) else {}
+        viability_tier = str(sw_obj.get("viability_tier", "unknown"))
+        viability_prob = float(sw_obj.get("viability_prob", 0.5))
+        survival_net_prob = float(sw_obj.get("survival_net_prob", viability_prob))
     else:
         category = str(pred.category)
         heads = getattr(pred, "heads", {})
@@ -178,55 +250,76 @@ def normalize_prediction(pred: Any, row: Mapping[str, Any]) -> Dict[str, Any]:
         anime = str(pred.anime)
         lang = str(pred.lang)
         eng_subs = str(pred.english_subs)
+        title_lang = str(getattr(pred, "title_language", _head_label(heads, "title_language", "english_title")))
+        owner_scope = str(getattr(pred, "owner_scope", _head_label(heads, "owner_scope", "allowed_type")))
         gates = getattr(pred, "mondrian_gates", {})
         csam_safe = bool(getattr(pred, "csam_safety", {}).get("is_safe", True))
         honeypot = bool(getattr(pred, "honeypot_trap", {}).get("is_honeypot_trap", False))
-        viability_tier = str(getattr(pred, "swarm_viability", {}).get("viability_tier", "unknown"))
-        viability_prob = float(getattr(pred, "swarm_viability", {}).get("viability_prob", 0.5))
+        sw_obj = getattr(pred, "swarm_viability", {}) or {}
+        viability_tier = str(sw_obj.get("viability_tier", "unknown"))
+        viability_prob = float(sw_obj.get("viability_prob", 0.5))
+        survival_net_prob = float(sw_obj.get("survival_net_prob", viability_prob))
 
     disguised_exec = has_disguised_executable(
         str(row.get("name") or ""),
         row.get("files") or [],
         category,
     )
+    span_bio = heads.get("span_bio") if isinstance(heads, Mapping) and isinstance(heads.get("span_bio"), Mapping) else None
     return {
         "infohash": str(row.get("infohash") or "").lower(),
         "category": category,
         "adult": adult,
         "junk": "junk" if disguised_exec else junk,
         "anime": anime,
-        "anime_dub_status": heads.get("anime", {}).get("anime_dub_status") if isinstance(heads, Mapping) and isinstance(heads.get("anime"), Mapping) else None,
+        "anime_dub_status": (
+            heads.get("anime", {}).get("anime_dub_status")
+            if isinstance(heads, Mapping) and isinstance(heads.get("anime"), Mapping)
+            else None
+        ),
         "lang": lang,
         "english_subs": eng_subs,
+        "title_language": title_lang,
+        "owner_scope": owner_scope,
+        "span_bio": span_bio,
         "csam_safe": csam_safe,
         "disguised_executable": disguised_exec,
         "honeypot_trap": honeypot,
         "viability_tier": viability_tier,
         "viability_prob": viability_prob,
+        "survival_net_prob": survival_net_prob,
         "mondrian_passed": bool(gates.get("passed_all", True)) and not disguised_exec,
     }
 
 
 class BitmagnetConnector:
-    """Minimal, high-efficiency connector for stock upstream `bitmagnet-io/bitmagnet`."""
+    """Turnkey connector & Torznab pre-grab filter for stock upstream `bitmagnet-io/bitmagnet`."""
 
     def __init__(
         self,
         classifier: Any,
         *,
         graphql_url: str = "http://localhost:3333/graphql",
+        upstream_torznab_url: str = "http://localhost:3333/torznab",
         graphql_transport: Optional[Callable[[str, Mapping[str, Any]], Dict[str, Any]]] = None,
         prune_malware_and_honeypots: bool = True,
         prune_dead_swarms: bool = False,
         isolate_adult_namespace: bool = True,
+        require_english_audio: bool = False,
+        allow_english_subs: bool = True,
+        reject_dead_swarms: bool = True,
         max_seen_cache: int = 50_000,
     ) -> None:
         self.classifier = classifier
         self.graphql_url = graphql_url
+        self.upstream_torznab_url = upstream_torznab_url.rstrip("/")
         self._transport = graphql_transport or self._default_graphql_transport
         self.prune_malware_and_honeypots = prune_malware_and_honeypots
         self.prune_dead_swarms = prune_dead_swarms
         self.isolate_adult_namespace = isolate_adult_namespace
+        self.require_english_audio = require_english_audio
+        self.allow_english_subs = allow_english_subs
+        self.reject_dead_swarms = reject_dead_swarms
         self.max_seen_cache = max_seen_cache
         self._seen: OrderedDict[str, None] = OrderedDict()
 
@@ -398,6 +491,10 @@ class BitmagnetConnector:
                 f"armiger-{pred['category']}",
                 f"armiger-lang-{pred['lang']}",
             ]
+            if pred.get("title_language") == "non_english_title":
+                raw_tags.append("armiger-title-non-english")
+            elif pred.get("title_language") == "english_title":
+                raw_tags.append("armiger-title-english")
             if pred["viability_tier"] != "unknown":
                 raw_tags.append(f"armiger-viability-{pred['viability_tier']}")
             if pred["anime"] == "anime":
@@ -413,15 +510,24 @@ class BitmagnetConnector:
                 grouped_tags.setdefault(tag_key, []).append(ih)
                 self._mark_seen(ih)
 
-            actions.append({
+            action_entry: Dict[str, Any] = {
                 "infoHash": ih,
                 "action": "tag",
                 "contentType": bitmagnet_type,
                 "armigerCategory": pred["category"],
+                "titleLanguage": pred.get("title_language", "english_title"),
+                "ownerScope": pred.get("owner_scope", "allowed_type"),
                 "tags": list(tag_key),
                 "viabilityTier": pred["viability_tier"],
                 "mondrianPassed": pred["mondrian_passed"],
-            })
+            }
+            if pred.get("span_bio"):
+                action_entry["spanBio"] = {
+                    "title": pred["span_bio"].get("title"),
+                    "year": pred["span_bio"].get("year"),
+                    "episode": pred["span_bio"].get("episode"),
+                }
+            actions.append(action_entry)
 
         put_tags_mutations = [
             mut
@@ -507,9 +613,144 @@ class BitmagnetConnector:
                 self._transport(self.graphql_url, tag_mut)
         return result
 
+    @staticmethod
+    def _extract_torznab_item_row(item_elem: ET.Element) -> Dict[str, Any]:
+        title = (item_elem.findtext("title") or "").strip()
+        size_text = item_elem.findtext("size") or "0"
+        try:
+            size_val = int(size_text)
+        except ValueError:
+            size_val = 0
+
+        attrs: Dict[str, str] = {}
+        for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr"):
+            name = (attr.attrib.get("name") or "").lower().strip()
+            val = attr.attrib.get("value") or ""
+            if name:
+                attrs[name] = val
+
+        seeders = int(attrs.get("seeders", "0") or 0)
+        peers = int(attrs.get("peers", "0") or 0)
+        leechers = max(peers - seeders, int(attrs.get("leechers", "0") or 0))
+        grabs = int(attrs["grabs"]) if "grabs" in attrs and attrs["grabs"].strip() else None
+        infohash = attrs.get("infohash") or ""
+
+        files_attr = attrs.get("files") or ""
+        if files_attr:
+            files = [{"path": p.strip(), "size": size_val} for p in files_attr.split(";") if p.strip()]
+        else:
+            tail = title.rsplit(".", 1)[-1].lower() if "." in title else ""
+            known_exts = {
+                "mkv", "mp4", "avi", "flac", "mp3", "m4b", "epub", "pdf",
+                "cbz", "cbr", "iso", "exe", "scr", "vbs", "bat", "cmd", "lnk", "ps1", "msi",
+            }
+            if tail in known_exts:
+                files = [{"path": title, "size": size_val}]
+            else:
+                low = title.lower()
+                if any(k in low for k in ("flac", "24bit", "lossless")):
+                    synth_ext = ".flac"
+                elif any(k in low for k in ("m4b", "audiobook", "unabridged")):
+                    synth_ext = ".m4b"
+                elif any(k in low for k in ("epub", "ebook")):
+                    synth_ext = ".epub"
+                elif any(k in low for k in ("cbz", "cbr")):
+                    synth_ext = ".cbz"
+                else:
+                    synth_ext = ".mkv"
+                files = [{"path": f"{title}{synth_ext}", "size": size_val}]
+
+        return {
+            "infohash": infohash,
+            "name": title,
+            "size": size_val,
+            "files": files,
+            "file_count": len(files),
+            "swarm": {
+                "tracker_known": bool(seeders > 0 or leechers > 0 or "seeders" in attrs),
+                "tracker_seeders": seeders,
+                "tracker_leechers": leechers,
+                "tracker_completed": grabs,
+            },
+        }
+
+    def should_admit_torznab(self, pred: Mapping[str, Any]) -> Tuple[bool, str]:
+        """Evaluate whether a Torznab XML item should be admitted to Prowlarr / `*Arr`."""
+        if not pred["csam_safe"] or pred["disguised_executable"]:
+            return False, "disguised_executable" if pred["disguised_executable"] else "csam_or_safety_blocked"
+        if pred["honeypot_trap"]:
+            return False, "honeypot_trap_blocked"
+        if pred["junk"] == "junk" or not pred["mondrian_passed"]:
+            return False, "mondrian_gate_blocked"
+        if self.reject_dead_swarms and pred["viability_tier"] == "dead":
+            return False, "dead_swarm_blocked"
+        if self.require_english_audio and pred["lang"] == "non_english":
+            has_subs = pred["english_subs"] == "has_eng_subs"
+            if not (self.allow_english_subs and has_subs):
+                return False, "non_english_audio_blocked"
+        return True, "admitted"
+
+    def filter_torznab_xml(self, xml_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
+        """Filter blocked `<item>` nodes from Bitmagnet Torznab XML and attach `armiger_*` attributes."""
+        root = ET.fromstring(xml_bytes)
+        channel = root.find("channel")
+        if channel is None:
+            return xml_bytes, {"total": 0, "admitted": 0, "blocked": 0, "blocked_reasons": {}}
+
+        items = channel.findall("item")
+        if not items:
+            return xml_bytes, {"total": 0, "admitted": 0, "blocked": 0, "blocked_reasons": {}}
+
+        rows = [self._extract_torznab_item_row(it) for it in items]
+        preds = self._run_batch_inference(rows)
+
+        admitted_count = 0
+        blocked_count = 0
+        blocked_reasons: Dict[str, int] = {}
+
+        for item_elem, pred in zip(items, preds):
+            admit, reason = self.should_admit_torznab(pred)
+            if not admit:
+                channel.remove(item_elem)
+                blocked_count += 1
+                blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
+                continue
+
+            admitted_count += 1
+            for attr_name, attr_val in (
+                ("armiger_category", str(pred["category"])),
+                ("armiger_lang", str(pred["lang"])),
+                ("armiger_title_lang", str(pred.get("title_language", "english_title"))),
+                ("armiger_viability", str(pred["viability_tier"])),
+                ("armiger_survival_prob", f"{float(pred.get('survival_net_prob', pred['viability_prob'])):.4f}"),
+            ):
+                attr_el = ET.SubElement(item_elem, f"{{{TORZNAB_NS}}}attr")
+                attr_el.set("name", attr_name)
+                attr_el.set("value", attr_val)
+
+        filtered_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        stats = {
+            "total": len(items),
+            "admitted": admitted_count,
+            "blocked": blocked_count,
+            "blocked_reasons": blocked_reasons,
+        }
+        return filtered_bytes, stats
+
+    def health_payload(self) -> Dict[str, Any]:
+        clf = self.classifier
+        return {
+            "status": "ok",
+            "connector": "bitmagnet",
+            "pipeline": type(clf).__name__,
+            "variant": str(getattr(clf, "variant", os.environ.get("ARMIGER_VARIANT", "ultra"))),
+            "zeroCueCatalogLoaded": bool(getattr(clf, "_zero_cue_catalog", None) is not None),
+            "swarmAdapterLoaded": bool(hasattr(getattr(clf, "swarm_adapter", None), "junk_encoder")),
+        }
+
 
 def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: int = 8096) -> ThreadingHTTPServer:
-    """Create a lightweight HTTP server exposing `/healthz` and `/v1/bitmagnet/classify`."""
+    """Create a lightweight HTTP server exposing `/healthz`, `/v1/bitmagnet/classify`, and `/torznab`."""
 
     class Handler(BaseHTTPRequestHandler):
         def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
@@ -522,9 +763,43 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
-                self._send_json(200, {"status": "ok", "connector": "bitmagnet"})
-            else:
-                self._send_json(404, {"error": "not_found"})
+                self._send_json(200, connector.health_payload())
+                return
+
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path.startswith("/torznab") or parsed.path.startswith("/api"):
+                params = urllib.parse.parse_qs(parsed.query)
+                t_param = (params.get("t") or [""])[0].lower()
+                subpath = parsed.path[len("/torznab"):] if parsed.path.startswith("/torznab") else parsed.path
+                target = f"{connector.upstream_torznab_url}{subpath}"
+                if parsed.query:
+                    target = f"{target}?{parsed.query}"
+                try:
+                    req = urllib.request.Request(target, method="GET")
+                    with urllib.request.urlopen(req, timeout=15.0) as resp:
+                        raw_xml = resp.read()
+                        content_type = resp.headers.get("Content-Type", "application/rss+xml; charset=utf-8")
+                except Exception as exc:
+                    self._send_json(502, {"error": "upstream_torznab_error", "detail": str(exc)})
+                    return
+
+                if t_param in ("caps", ""):
+                    out_bytes = raw_xml
+                    stats = {"total": 0, "admitted": 0, "blocked": 0}
+                else:
+                    out_bytes, stats = connector.filter_torznab_xml(raw_xml)
+
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("X-Armiger-Total", str(stats["total"]))
+                self.send_header("X-Armiger-Admitted", str(stats["admitted"]))
+                self.send_header("X-Armiger-Blocked", str(stats["blocked"]))
+                self.send_header("Content-Length", str(len(out_bytes)))
+                self.end_headers()
+                self.wfile.write(out_bytes)
+                return
+
+            self._send_json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
@@ -550,34 +825,61 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
 
 def main() -> None:
     model_dir = os.environ.get("ARMIGER_MODEL_DIR", ".")
-    variant = os.environ.get("ARMIGER_VARIANT", "int8")
+    variant = os.environ.get("ARMIGER_VARIANT", "ultra")
+    auto_download = os.environ.get("ARMIGER_AUTO_DOWNLOAD", "true").lower() == "true"
     graphql_url = os.environ.get("BITMAGNET_GRAPHQL_URL", "http://localhost:3333/graphql")
+    upstream_torznab_url = os.environ.get("UPSTREAM_TORZNAB_URL", "http://localhost:3333/torznab")
     poll_interval = float(os.environ.get("BITMAGNET_POLL_SECONDS", "5.0"))
     batch_size = int(os.environ.get("BITMAGNET_BATCH_SIZE", "100"))
-    mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "poll")
+    mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "both").strip().lower()
 
-    clf = load_armiger_classifier(model_dir, variant=variant)
+    clf = load_armiger_classifier(model_dir, variant=variant, auto_download=auto_download)
     connector = BitmagnetConnector(
         clf,
         graphql_url=graphql_url,
+        upstream_torznab_url=upstream_torznab_url,
         prune_malware_and_honeypots=os.environ.get("ARMIGER_PRUNE_MALWARE", "true").lower() == "true",
         prune_dead_swarms=os.environ.get("ARMIGER_PRUNE_DEAD_SWARMS", "false").lower() == "true",
+        require_english_audio=os.environ.get("ARMIGER_REQUIRE_ENGLISH_AUDIO", "false").lower() == "true",
+        allow_english_subs=os.environ.get("ARMIGER_ALLOW_ENGLISH_SUBS", "true").lower() == "true",
+        reject_dead_swarms=os.environ.get("ARMIGER_REJECT_DEAD_SWARMS", "true").lower() == "true",
     )
 
+    host = os.environ.get("ARMIGER_CONNECTOR_HOST") or os.environ.get("ARMIGER_BRIDGE_HOST") or "0.0.0.0"
+    port = int(os.environ.get("ARMIGER_CONNECTOR_PORT") or os.environ.get("ARMIGER_BRIDGE_PORT") or "8096")
+    proxy_port = int(os.environ.get("ARMIGER_PROXY_PORT", "8097"))
+    enable_proxy_port = os.environ.get("ARMIGER_ENABLE_TORZNAB_PROXY", "true").lower() == "true"
+
     if mode == "http":
-        host = os.environ.get("ARMIGER_CONNECTOR_HOST", "127.0.0.1")
-        port = int(os.environ.get("ARMIGER_CONNECTOR_PORT", "8096"))
+        if enable_proxy_port and proxy_port > 0 and proxy_port != port:
+            proxy_srv = create_server(connector, host=host, port=proxy_port)
+            threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+            print(f"Armiger Torznab pre-grab proxy listening on {host}:{proxy_port}", flush=True)
         srv = create_server(connector, host=host, port=port)
-        print(f"Armiger Bitmagnet HTTP connector listening on {host}:{port}")
+        print(f"Armiger Bitmagnet HTTP connector listening on {host}:{port}", flush=True)
         srv.serve_forever()
-    else:
-        print(f"Armiger Bitmagnet poller connected to {graphql_url} (interval={poll_interval}s, batch={batch_size})")
-        while True:
-            try:
-                connector.sync_once(limit=batch_size, apply_mutations=True)
-            except Exception as exc:
-                print(f"[bitmagnet-connector] poll error: {exc}", file=sys.stderr)
-            time.sleep(poll_interval)
+        return
+
+    if mode == "both":
+        srv = create_server(connector, host=host, port=port)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"Armiger Bitmagnet HTTP connector listening on {host}:{port}", flush=True)
+        if enable_proxy_port and proxy_port > 0 and proxy_port != port:
+            proxy_srv = create_server(connector, host=host, port=proxy_port)
+            threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+            print(f"Armiger Torznab pre-grab proxy listening on {host}:{proxy_port}", flush=True)
+
+    print(
+        f"Armiger Bitmagnet poller connected to {graphql_url} "
+        f"(variant={variant}, interval={poll_interval}s, batch={batch_size})",
+        flush=True,
+    )
+    while True:
+        try:
+            connector.sync_once(limit=batch_size, apply_mutations=True)
+        except Exception as exc:
+            print(f"[bitmagnet-connector] poll error: {exc}", file=sys.stderr, flush=True)
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":

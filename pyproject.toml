@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "armiger-connectors"
-version = "1.0.0"
-description = "Minimal, high-efficiency connectors integrating Armiger with stock upstream Bitmagnet and Rats Search."
+version = "1.1.0"
+description = "Turnkey connectors integrating Armiger and Armiger Ultra with Bitmagnet, Rats Search, DH-Waypoint, and the *Arr Stack."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -13,4 +13,4 @@ dependencies = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".", "bitmagnet", "rats-search"]
+pythonpath = [".", "bitmagnet", "rats-search", "dh-waypoint", "arr-stack"]

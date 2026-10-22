@@ -599,17 +599,26 @@ def create_server(connector: RatsSearchConnector, host: str = "127.0.0.1", port:
 
 
 def main() -> None:
-    model_dir = os.environ.get("ARMIGER_MODEL_DIR", ".")
-    variant = os.environ.get("ARMIGER_VARIANT", "int8")
+    import threading
+
+    model_dir = os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model")
+    variant = os.environ.get("ARMIGER_VARIANT", "ultra")
+    preload_catalog = os.environ.get("ARMIGER_USE_ZERO_CUE_CATALOG", "true").lower() == "true"
+    auto_download = os.environ.get("ARMIGER_AUTO_DOWNLOAD", "true").lower() == "true"
     rest_url = os.environ.get("RATS_REST_URL", "http://127.0.0.1:8095")
     manticore_host = os.environ.get("RATS_MANTICORE_HOST", "127.0.0.1")
     manticore_port = int(os.environ.get("RATS_MANTICORE_PORT", "9306"))
     enable_manticore_sql = os.environ.get("RATS_ENABLE_MANTICORE_SQL", "true").lower() == "true"
     poll_interval = float(os.environ.get("RATS_POLL_SECONDS", "5.0"))
     batch_size = int(os.environ.get("RATS_BATCH_SIZE", "100"))
-    mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "poll")
+    mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "both").lower()
 
-    clf = load_armiger_classifier(model_dir, variant=variant)
+    clf = load_armiger_classifier(
+        model_dir,
+        variant=variant,
+        preload_catalog=preload_catalog,
+        auto_download=auto_download,
+    )
     connector = RatsSearchConnector(
         clf,
         rest_base_url=rest_url,
@@ -622,20 +631,28 @@ def main() -> None:
     if enable_manticore_sql:
         connector._sql_executor = connector.default_mysql41_executor
 
-    if mode == "http":
-        host = os.environ.get("ARMIGER_CONNECTOR_HOST", "127.0.0.1")
-        port = int(os.environ.get("ARMIGER_CONNECTOR_PORT", "8097"))
+    host = os.environ.get("ARMIGER_CONNECTOR_HOST", "0.0.0.0")
+    port = int(os.environ.get("ARMIGER_CONNECTOR_PORT", "8097"))
+
+    if mode in ("http", "both"):
         srv = create_server(connector, host=host, port=port)
-        print(f"Armiger rats-search HTTP connector listening on {host}:{port}")
-        srv.serve_forever()
-    else:
-        print(f"Armiger rats-search poller connected to {rest_url} (interval={poll_interval}s, batch={batch_size})")
-        while True:
-            try:
-                connector.sync_recent_once(limit=batch_size, enrich_files=True, apply_changes=True)
-            except Exception as exc:
-                print(f"[rats-search-connector] poll error: {exc}", file=sys.stderr)
-            time.sleep(poll_interval)
+        if mode == "http":
+            print(f"Armiger rats-search HTTP connector listening on {host}:{port}", flush=True)
+            srv.serve_forever()
+            return
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"Armiger rats-search HTTP server listening on {host}:{port}", flush=True)
+
+    print(
+        f"Armiger rats-search poller connected to {rest_url} (interval={poll_interval}s, batch={batch_size})",
+        flush=True,
+    )
+    while True:
+        try:
+            connector.sync_recent_once(limit=batch_size, enrich_files=True, apply_changes=True)
+        except Exception as exc:
+            print(f"[rats-search-connector] poll error: {exc}", file=sys.stderr, flush=True)
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":
