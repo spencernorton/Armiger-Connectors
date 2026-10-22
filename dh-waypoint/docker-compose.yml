@@ -1,0 +1,100 @@
+services:
+  dh-waypoint:
+    image: ghcr.io/spencernorton/dh-waypoint:v5.6.0
+    container_name: dh-waypoint
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      armiger-ultra:
+        condition: service_healthy
+    ports:
+      - "3333:3333"
+      - "3334:3334/tcp"
+      - "3334:3334/udp"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: dh_waypoint
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      DH_WAYPOINT_PROCESSORS_PLUGIN_DIR: /etc/dh-waypoint/plugins.d
+    volumes:
+      - ./07-armiger-ultra.plugin.yml:/etc/dh-waypoint/plugins.d/07-armiger-ultra.plugin.yml:ro
+    command:
+      - worker
+      - run
+      - --keys=http_server
+      - --keys=queue_server
+      - --keys=dht_crawler
+
+  armiger-ultra:
+    image: python:3.12-slim
+    container_name: armiger-ultra
+    restart: unless-stopped
+    working_dir: /var/lib/armiger
+    ports:
+      - "${ARMIGER_PORT:-8095}:8095"
+    environment:
+      ARMIGER_MODEL_DIR: /var/lib/armiger/model
+      ARMIGER_HF_REPO: "${ARMIGER_HF_REPO:-NorviTech/armiger-ultra}"
+      ARMIGER_AUTO_DOWNLOAD: "${ARMIGER_AUTO_DOWNLOAD:-true}"
+      ARMIGER_VARIANT: "${ARMIGER_VARIANT:-fp32}"
+      ARMIGER_HOST: "0.0.0.0"
+      ARMIGER_PORT: "8095"
+      ARMIGER_ADULT_THRESHOLD: "0.35"
+      ARMIGER_JUNK_THRESHOLD: "0.25"
+      ARMIGER_SCOPE_THRESHOLD: "0.35"
+      ARMIGER_USE_ZERO_CUE_CATALOG: "${ARMIGER_USE_ZERO_CUE_CATALOG:-true}"
+      ARMIGER_DHT_RSI_MODE: "${ARMIGER_DHT_RSI_MODE:-pull_only}"
+    volumes:
+      - armiger_state:/var/lib/armiger
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        pip install --no-cache-dir --quiet numpy onnxruntime cryptography huggingface_hub
+        pip install --no-cache-dir --quiet --index-url https://download.pytorch.org/whl/cpu torch || true
+        python3 -c '
+        import os, urllib.request
+        from pathlib import Path
+        from huggingface_hub import snapshot_download
+        base = "https://raw.githubusercontent.com/spencernorton/Armiger-Connectors/main"
+        for sub, fn in (("bitmagnet", "bitmagnet_connector.py"), ("dh-waypoint", "armiger_waypoint_processor.py")):
+            dst = Path("/var/lib/armiger") / sub / fn
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.is_file():
+                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(dst))
+        model_dir = Path(os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model"))
+        if not (model_dir / "armiger_onnx.py").is_file():
+            model_dir.mkdir(parents=True, exist_ok=True)
+            snapshot_download(repo_id=os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra"), local_dir=str(model_dir))
+        '
+        exec python3 /var/lib/armiger/dh-waypoint/armiger_waypoint_processor.py
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: dh-waypoint-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dh_waypoint
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+    volumes:
+      - dh_waypoint_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d dh_waypoint -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  armiger_state:
+  dh_waypoint_pgdata:

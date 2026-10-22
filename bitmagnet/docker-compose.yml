@@ -3,14 +3,15 @@ services:
     image: postgres:16-alpine
     container_name: bitmagnet-postgres
     restart: unless-stopped
+    shm_size: 256mb
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: bitmagnet
+      POSTGRES_DB: "${POSTGRES_DB:-bitmagnet}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-bitmagnet}"
     volumes:
       - bitmagnet_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB:-bitmagnet} -U $${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -23,13 +24,15 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "127.0.0.1:3333:3333"
-      - "3334:3334/tcp"
-      - "3334:3334/udp"
+      - "${BITMAGNET_HTTP_PORT:-3333}:3333"
+      - "${BITMAGNET_DHT_PORT:-3334}:3334/tcp"
+      - "${BITMAGNET_DHT_PORT:-3334}:3334/udp"
     environment:
       POSTGRES_HOST: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      POSTGRES_NAME: "${POSTGRES_DB:-bitmagnet}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-bitmagnet}"
+      TMDB_API_KEY: "${TMDB_API_KEY:-}"
     command:
       - worker
       - run
@@ -37,28 +40,77 @@ services:
       - --keys=queue_server
       - --keys=dht_crawler
 
-  armiger-bitmagnet-connector:
-    image: python:3.11-slim
+  armiger-ultra:
+    image: python:3.12-slim
     container_name: armiger-bitmagnet-connector
     restart: unless-stopped
     depends_on:
-      - bitmagnet
-    working_dir: /app
-    volumes:
-      - ./bitmagnet_connector.py:/app/bitmagnet_connector.py:ro
-      - ${ARMIGER_MODEL_DIR:-../armiger}:/models/armiger:ro
+      postgres:
+        condition: service_healthy
+      bitmagnet:
+        condition: service_started
+    working_dir: /data/armiger
+    ports:
+      - "${ARMIGER_BRIDGE_PORT:-8096}:8096"
+      - "${ARMIGER_PROXY_PORT:-8097}:8097"
     environment:
-      ARMIGER_MODEL_DIR: /models/armiger
-      ARMIGER_VARIANT: int8
-      BITMAGNET_GRAPHQL_URL: http://bitmagnet:3333/graphql
-      BITMAGNET_POLL_SECONDS: "5"
-      BITMAGNET_BATCH_SIZE: "100"
-      ARMIGER_PRUNE_MALWARE: "true"
-      ARMIGER_PRUNE_DEAD_SWARMS: "false"
+      ARMIGER_MODEL_DIR: "/data/armiger/model"
+      ARMIGER_HF_REPO: "${ARMIGER_HF_REPO:-NorviTech/armiger-ultra}"
+      ARMIGER_AUTO_DOWNLOAD: "${ARMIGER_AUTO_DOWNLOAD:-true}"
+      ARMIGER_VARIANT: "${ARMIGER_VARIANT:-ultra}"
+      ARMIGER_USE_ZERO_CUE_CATALOG: "${ARMIGER_USE_ZERO_CUE_CATALOG:-true}"
+      ARMIGER_DHT_RSI_MODE: "${ARMIGER_DHT_RSI_MODE:-pull_only}"
+      ARMIGER_CONNECTOR_MODE: "${ARMIGER_CONNECTOR_MODE:-both}"
+      ARMIGER_CONNECTOR_HOST: "0.0.0.0"
+      ARMIGER_CONNECTOR_PORT: "8096"
+      ARMIGER_PROXY_PORT: "8097"
+      BITMAGNET_GRAPHQL_URL: "${BITMAGNET_GRAPHQL_URL:-http://bitmagnet:3333/graphql}"
+      UPSTREAM_TORZNAB_URL: "${UPSTREAM_TORZNAB_URL:-http://bitmagnet:3333/torznab}"
+      BITMAGNET_POLL_SECONDS: "${BITMAGNET_POLL_SECONDS:-5}"
+      BITMAGNET_BATCH_SIZE: "${BITMAGNET_BATCH_SIZE:-100}"
+      ARMIGER_PRUNE_MALWARE: "${ARMIGER_PRUNE_MALWARE:-true}"
+      ARMIGER_PRUNE_DEAD_SWARMS: "${ARMIGER_PRUNE_DEAD_SWARMS:-false}"
+      ARMIGER_REQUIRE_ENGLISH_AUDIO: "${ARMIGER_REQUIRE_ENGLISH_AUDIO:-false}"
+      ARMIGER_ALLOW_ENGLISH_SUBS: "${ARMIGER_ALLOW_ENGLISH_SUBS:-true}"
+      ARMIGER_REJECT_DEAD_SWARMS: "${ARMIGER_REJECT_DEAD_SWARMS:-true}"
+    volumes:
+      - .:/workspace:ro
+      - ${ARMIGER_HOST_MODEL_DIR:-.}:/host_model:ro
+      - armiger_data:/data/armiger
     command:
       - /bin/sh
-      - -c
-      - "pip install --no-cache-dir numpy onnxruntime && python3 /app/bitmagnet_connector.py"
+      - -ec
+      - |
+        if [ ! -f /data/armiger/.venv/.armiger_ultra_v3_ready ]; then
+          python3 -m venv /data/armiger/.venv
+          /data/armiger/.venv/bin/pip install --no-cache-dir --upgrade pip
+          /data/armiger/.venv/bin/pip install --no-cache-dir numpy onnxruntime cryptography huggingface_hub
+          /data/armiger/.venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          touch /data/armiger/.venv/.armiger_ultra_v3_ready
+        fi
+        if [ -f /host_model/armiger_ultra_pipeline.py ]; then
+          export ARMIGER_MODEL_DIR=/host_model
+        elif [ -f /workspace/armiger_ultra_pipeline.py ]; then
+          export ARMIGER_MODEL_DIR=/workspace
+        fi
+        if [ -f /workspace/bitmagnet_connector.py ]; then
+          CONNECTOR_SCRIPT=/workspace/bitmagnet_connector.py
+        elif [ -f /workspace/bitmagnet/bitmagnet_connector.py ]; then
+          CONNECTOR_SCRIPT=/workspace/bitmagnet/bitmagnet_connector.py
+        else
+          CONNECTOR_SCRIPT=/data/armiger/bitmagnet_connector.py
+          if [ ! -f "$$CONNECTOR_SCRIPT" ]; then
+            /data/armiger/.venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/spencernorton/Armiger-Connectors/main/bitmagnet/bitmagnet_connector.py', '/data/armiger/bitmagnet_connector.py')"
+          fi
+        fi
+        exec /data/armiger/.venv/bin/python3 "$$CONNECTOR_SCRIPT"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/healthz', timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
 
 volumes:
   bitmagnet_pgdata:
+  armiger_data:

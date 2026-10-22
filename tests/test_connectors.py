@@ -496,3 +496,71 @@ def test_rats_websocket_event_handler_and_http_server() -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_bitmagnet_torznab_xml_filtering_and_v3_title_language() -> None:
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        require_english_audio=False,
+        reject_dead_swarms=True,
+    )
+    sample_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Bitmagnet Torznab</title>
+    <item>
+      <title>Sintel.2010.1080p.BluRay.x264</title>
+      <size>4200000000</size>
+      <torznab:attr name="infohash" value="1111111111111111111111111111111111111111"/>
+      <torznab:attr name="seeders" value="25"/>
+      <torznab:attr name="peers" value="28"/>
+    </item>
+    <item>
+      <title>Fake.Malware.Lure.2025.1080p.mkv.exe</title>
+      <size>14000000</size>
+      <torznab:attr name="infohash" value="2222222222222222222222222222222222222222"/>
+      <torznab:attr name="seeders" value="90"/>
+      <torznab:attr name="peers" value="90"/>
+    </item>
+    <item>
+      <title>Dead.Swarm.Movie.2019.1080p.mkv</title>
+      <size>2100000000</size>
+      <torznab:attr name="infohash" value="3333333333333333333333333333333333333333"/>
+      <torznab:attr name="seeders" value="0"/>
+      <torznab:attr name="peers" value="0"/>
+    </item>
+  </channel>
+</rss>"""
+    filtered_xml, stats = connector.filter_torznab_xml(sample_xml)
+    assert stats["total"] == 3
+    assert stats["admitted"] == 1
+    assert stats["blocked"] == 2
+    assert stats["blocked_reasons"].get("disguised_executable") == 1
+    assert stats["blocked_reasons"].get("dead_swarm_blocked") == 1
+    decoded = filtered_xml.decode("utf-8")
+    assert "Sintel.2010.1080p.BluRay.x264" in decoded
+    assert "Fake.Malware.Lure" not in decoded
+    assert "armiger_category" in decoded
+    assert "armiger_title_lang" in decoded
+
+
+def test_turnkey_docker_compose_files_have_no_broken_host_binds_or_missing_deps() -> None:
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[1]
+    compose_paths = [
+        repo_root / "bitmagnet" / "docker-compose.yml",
+        repo_root / "rats-search" / "docker-compose.yml",
+        repo_root / "dh-waypoint" / "docker-compose.yml",
+        repo_root / "arr-stack" / "docker-compose.yml",
+    ]
+    for cpath in compose_paths:
+        assert cpath.is_file(), f"Missing compose file: {cpath}"
+        raw = cpath.read_text(encoding="utf-8")
+        # Must not require relative ../armiger or ../.. host bind mounts
+        assert "../armiger" not in raw, f"{cpath} still references ../armiger"
+        assert "../..:/app" not in raw, f"{cpath} still references ../..:/app"
+        # Must install cryptography, onnxruntime, numpy, huggingface_hub
+        for pkg in ("numpy", "onnxruntime", "cryptography", "huggingface_hub"):
+            assert pkg in raw, f"{cpath} missing required package {pkg}"
+        # Must not bind container HTTP server to localhost when publishing ports
+        assert 'ARMIGER_BRIDGE_HOST: "localhost"' not in raw
