@@ -660,7 +660,8 @@ class BitmagnetConnector:
         infohash = attrs.get("infohash") or ""
 
         files_attr = attrs.get("files") or ""
-        if files_attr:
+        # Torznab defines `files` as a file count, which carries no paths.
+        if files_attr and not files_attr.strip().isdigit():
             files = [{"path": p.strip(), "size": size_val} for p in files_attr.split(";") if p.strip()]
         else:
             tail = title.rsplit(".", 1)[-1].lower() if "." in title else ""
