@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -119,8 +120,12 @@ mutation TorrentPutTags($infoHashes: [Hash20!]!, $tagNames: [String!]!) {
 
 
 def sanitize_bitmagnet_tag(tag: str) -> str:
-    """Normalize a tag into stock Bitmagnet's required kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`)."""
-    return _NON_KEBAB_RE.sub("-", str(tag or "").strip().lower()).strip("-")
+    """Normalize to stock Bitmagnet's kebab-case and 30-character limit."""
+    normalized = _NON_KEBAB_RE.sub("-", str(tag or "").strip().lower()).strip("-")
+    if len(normalized) > 30:
+        suffix = hashlib.sha256(normalized.encode()).hexdigest()[:8]
+        normalized = normalized[:21].rstrip("-") + "-" + suffix
+    return normalized
 
 
 def _has_armiger_artifacts(mpath: Path) -> bool:
