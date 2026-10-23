@@ -564,3 +564,35 @@ def test_turnkey_docker_compose_files_have_no_broken_host_binds_or_missing_deps(
             assert pkg in raw, f"{cpath} missing required package {pkg}"
         # Must not bind container HTTP server to localhost when publishing ports
         assert 'ARMIGER_BRIDGE_HOST: "localhost"' not in raw
+
+
+def test_installed_armiger_loader_uses_verified_data_without_cache_imports(monkeypatch, tmp_path):
+    """A model cache must not become an executable Python search path."""
+    import sys
+    import types
+    import bitmagnet_connector as module
+
+    calls = []
+    package = types.ModuleType("armiger")
+    artifacts = types.ModuleType("armiger.artifacts")
+
+    def download(directory, **kwargs):
+        calls.append((directory, kwargs))
+        return tmp_path
+
+    class Pipeline:
+        @staticmethod
+        def from_directory(directory, **kwargs):
+            return directory, kwargs
+
+    artifacts.download_model = download
+    package.ArmigerUltraPipeline = Pipeline
+    monkeypatch.setitem(sys.modules, "armiger", package)
+    monkeypatch.setitem(sys.modules, "armiger.artifacts", artifacts)
+    before = list(sys.path)
+    result = module.load_armiger_classifier(tmp_path, auto_download=False)
+    assert calls == [(tmp_path, {"variant": "ultra", "offline": True})]
+    assert result[0] == tmp_path
+    assert result[1]["opt_in_sharing"] is False
+    assert result[1]["rsi_mode"] == "pull_only"
+    assert sys.path == before
