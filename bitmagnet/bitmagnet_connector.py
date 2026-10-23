@@ -174,6 +174,25 @@ def load_armiger_classifier(
     hf_repo: Optional[str] = None,
 ) -> Any:
     """Load `ArmigerUltraPipeline` if present in `model_dir`, else `ArmigerONNXClassifier`."""
+    # Installed Armiger owns code and verified data downloads. Never import code
+    # from the model cache in this path; legacy HF bundles remain supported below.
+    try:
+        from armiger.artifacts import download_model
+    except ImportError:
+        download_model = None
+    if download_model is not None:
+        if hf_repo not in (None, "NorviTech/armiger-ultra"):
+            raise ValueError("Use a local verified model directory with installed Armiger")
+        from armiger import ArmigerUltraPipeline
+        preset = "all" if variant in ("cpu", "int8", "armiger") else "ultra"
+        mpath = download_model(model_dir, variant=preset, offline=not auto_download)
+        if preload_catalog is None:
+            preload_catalog = os.environ.get("ARMIGER_USE_ZERO_CUE_CATALOG", "true").lower() == "true"
+        return ArmigerUltraPipeline.from_directory(
+            mpath, variant=variant, preload_catalog=preload_catalog,
+            rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE", "pull_only"),
+            opt_in_sharing=False,
+        )
     eff_repo = hf_repo or os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra")
     mpath = ensure_armiger_model_dir(model_dir, hf_repo=eff_repo, auto_download=auto_download)
     if str(mpath) in sys.path:
