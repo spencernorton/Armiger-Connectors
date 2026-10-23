@@ -111,6 +111,19 @@ def test_disguised_executable_and_kebab_tag_sanitization() -> None:
     assert sanitize_bitmagnet_tag("armiger-viability-alive_viable") == "armiger-viability-alive-viable"
 
 
+def test_bitmagnet_accepts_long_viability_labels_without_merging_distinct_tags() -> None:
+    labels = ("armiger-viability-dead-known-zero", "armiger-viability-dead-known-unknown")
+    tags = [sanitize_bitmagnet_tag(label) for label in labels]
+    assert len(set(tags)) == 2
+    for label, tag in zip(labels, tags):
+        assert len(tag) <= 30
+        assert tag.startswith("armiger-") and not tag.endswith("-")
+        assert sanitize_bitmagnet_tag(label) == tag
+        assert sanitize_bitmagnet_tag(tag) == tag
+    mutation = BitmagnetConnector.build_put_tags_mutation(["ab" * 20], labels)
+    assert mutation["variables"]["tagNames"] == tags
+
+
 def test_bitmagnet_evaluate_batch_groups_tags_and_prunes_malware() -> None:
     connector = BitmagnetConnector(SyntheticArmigerClassifier())
     items = [
