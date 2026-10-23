@@ -7,6 +7,7 @@ import struct
 import threading
 from typing import Any, Dict, List, Mapping, Sequence
 import urllib.request
+import xml.etree.ElementTree as ET
 
 from bitmagnet_connector import (
     BitmagnetConnector,
@@ -542,6 +543,19 @@ def test_bitmagnet_torznab_xml_filtering_and_v3_title_language() -> None:
     assert "Fake.Malware.Lure" not in decoded
     assert "armiger_category" in decoded
     assert "armiger_title_lang" in decoded
+
+
+def test_torznab_numeric_files_attr_is_a_count_not_a_path() -> None:
+    item = ET.fromstring(
+        b"""<item xmlns:torznab="http://torznab.com/schemas/2015/feed">
+      <title>Sintel.2010.1080p.BluRay.x264</title>
+      <size>4200000000</size>
+      <torznab:attr name="files" value="36"/>
+      <torznab:attr name="seeders" value="25"/>
+    </item>"""
+    )
+    row = BitmagnetConnector._extract_torznab_item_row(item)
+    assert row["files"] == [{"path": "Sintel.2010.1080p.BluRay.x264.mkv", "size": 4_200_000_000}]
 
 
 def test_turnkey_docker_compose_files_have_no_broken_host_binds_or_missing_deps() -> None:
