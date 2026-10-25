@@ -1,3 +1,13 @@
+## 2026-10-24 — NorviTechGH — Remove the DH-Waypoint connector
+
+- **Branch:** remove-dh-waypoint-connector
+- **What changed:** Removed `dh-waypoint/` (processor, plugin file, Compose file and README) and the Torznab proxy's DH-Waypoint default upstream; the proxy now defaults to the Prowlarr URL its Compose file already sets. The README links to DH-Waypoint instead.
+- **Why:** The connector could not register with DH-Waypoint, which has its own Armiger Ultra integration.
+- **Validation:** Connector suite passes (14 tests).
+- **Deployment:** None.
+- **Next step:** None.
+- **Status file updated:** No.
+
 ## 2026-10-23 — codex — Bitmagnet tag length compatibility
 
 - **Branch:** codex/bitmagnet-tag-limit

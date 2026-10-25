@@ -577,7 +577,6 @@ def test_turnkey_docker_compose_files_have_no_broken_host_binds_or_missing_deps(
     compose_paths = [
         repo_root / "bitmagnet" / "docker-compose.yml",
         repo_root / "rats-search" / "docker-compose.yml",
-        repo_root / "dh-waypoint" / "docker-compose.yml",
         repo_root / "arr-stack" / "docker-compose.yml",
     ]
     for cpath in compose_paths:
