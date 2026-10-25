@@ -1,6 +1,6 @@
 """Armiger Torznab Filtering Proxy & Pre-Grab Admission Gate for Prowlarr, Bitmagnet, and the *Arr Stack.
 
-Sits transparently between upstream Torznab indexers (`Prowlarr`, `Bitmagnet`, `DH-Waypoint`, `Jackett`)
+Sits transparently between upstream Torznab indexers (`Prowlarr`, `Bitmagnet`, `Jackett`)
 and downstream Torznab media managers (`Sonarr`, `Radarr`, `Lidarr`, `Readarr`).
 
 Every Torznab XML `<item>` returned by an upstream search is evaluated in milliseconds by
@@ -198,7 +198,7 @@ class ArmigerTorznabFilter:
 def create_proxy_server(host: str = "localhost", port: int = 8097) -> ThreadingHTTPServer:
     model_dir = str(ensure_armiger_model_dir(os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model"), auto_download=os.environ.get("ARMIGER_AUTO_DOWNLOAD", "true").lower() == "true"))
     variant = os.environ.get("ARMIGER_VARIANT", "int8")
-    upstream_url = os.environ.get("UPSTREAM_TORZNAB_URL", "http://dh-waypoint:3333/torznab").rstrip("/")
+    upstream_url = os.environ.get("UPSTREAM_TORZNAB_URL", "http://prowlarr:9696/1/api").rstrip("/")
     pipeline = ArmigerUltraPipeline.from_directory(
         model_dir,
         variant=variant,

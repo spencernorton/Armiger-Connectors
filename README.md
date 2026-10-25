@@ -1,8 +1,8 @@
 <h1 align="center">Armiger-Connectors</h1>
 
 <p align="center">
-  <strong>Turnkey connectors and Docker Compose stacks for Bitmagnet, Rats Search, DH-Waypoint, and the *Arr ecosystem.</strong><br>
-  Drop-in Python sidecars that connect <a href="https://github.com/spencernorton/armiger">Armiger</a> and <a href="https://huggingface.co/NorviTech/armiger-ultra">Armiger Ultra</a> (<code>v3.0.0</code>, 9-head neural core + 6 plugins) to unmodified <a href="https://github.com/bitmagnet-io/bitmagnet">bitmagnet-io/bitmagnet</a>, <a href="https://github.com/librats/rats-search">librats/rats-search</a>, <a href="https://github.com/spencernorton/DH-Waypoint">spencernorton/DH-Waypoint</a>, and <code>Prowlarr</code>/<code>Sonarr</code>/<code>Radarr</code>/<code>Lidarr</code>/<code>Readarr</code>/<code>qBittorrent</code> deployments with zero upstream code changes.
+  <strong>Turnkey connectors and Docker Compose stacks for Bitmagnet, Rats Search, and the *Arr ecosystem.</strong><br>
+  Drop-in Python sidecars that connect <a href="https://github.com/spencernorton/armiger">Armiger</a> and <a href="https://huggingface.co/NorviTech/armiger-ultra">Armiger Ultra</a> (<code>v3.0.0</code>, 9-head neural core + 6 plugins) to unmodified <a href="https://github.com/bitmagnet-io/bitmagnet">bitmagnet-io/bitmagnet</a>, <a href="https://github.com/librats/rats-search">librats/rats-search</a>, and <code>Prowlarr</code>/<code>Sonarr</code>/<code>Radarr</code>/<code>Lidarr</code>/<code>Readarr</code>/<code>qBittorrent</code> deployments with zero upstream code changes.
 </p>
 
 <p align="center">
@@ -30,9 +30,9 @@
    - Purges disguised malware lures, safety violations, and honeypot traps via `GET /api/torrent.remove?hashes=[...]` so `TorrentRepository`'s in-memory `Statistics` counters stay synchronized.
    - Activates `rats-search`'s 9 granular `ContentCategory` IDs (`Movie=1` .. `Game=9`) and `XXX=100` in the Manticore `torrents` RT table using `rats-search`'s deterministic 63-bit `rowIdFromHash` docid lookup (`O(1)`) with collision verification over a built-in pure-Python `mysql41` wire client.
 
-3. **[`dh-waypoint/`](dh-waypoint/README.md) (`dh-waypoint/armiger_waypoint_processor.py` + `dh-waypoint/07-armiger-ultra.plugin.yml` + `dh-waypoint/docker-compose.yml`)** — Canonical `dh-waypoint.processor.v1` external processor for [`spencernorton/DH-Waypoint`](https://github.com/spencernorton/DH-Waypoint) supporting pre-ingest admission (`/v1/admit`), batch classification (`/v1/classify`), single-job processing (`/v1/process`), and 4-tier feedback (`/v1/feedback`).
+3. **[`arr-stack/`](arr-stack/README.md) (`arr-stack/armiger_torznab_proxy.py` + `arr-stack/armiger_arr_webhook_receiver.py` + `arr-stack/docker-compose.yml`)** — Standalone Torznab pre-grab XML admission proxy (`:8097`) and `*Arr`/qBittorrent post-import `ffprobe` ground-truth webhook receiver (`:8098`).
 
-4. **[`arr-stack/`](arr-stack/README.md) (`arr-stack/armiger_torznab_proxy.py` + `arr-stack/armiger_arr_webhook_receiver.py` + `arr-stack/docker-compose.yml`)** — Standalone Torznab pre-grab XML admission proxy (`:8097`) and `*Arr`/qBittorrent post-import `ffprobe` ground-truth webhook receiver (`:8098`).
+For a more capable DHT crawler, see [DH-Waypoint](https://github.com/spencernorton/DH-Waypoint). It works with any LLM, hosted or local, and supports many types of plugins.
 
 ---
 
