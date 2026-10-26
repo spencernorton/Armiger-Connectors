@@ -1,3 +1,13 @@
+## 2026-10-26 — NorviTechGH — Wire DHT auto-update observability and environment-resolved opt-in sharing
+
+- **Branch:** feat/dht-autoupdate-and-sharing-status
+- **What changed:** Pass `opt_in_sharing=None` and environment-resolved `rsi_mode` in `bitmagnet_connector.py` and `rats_search_connector.py` so `ARMIGER_DHT_SHARE_OPT_IN` resolves from the environment (strictly defaulting to `False` / `pull_only`), and expose `active_seq`, `active_bundle_merkle_root`, `model_source`, `last_dht_check_ts`, and `sharing_status()` on `/healthz`.
+- **Why:** Enable runtime observability of BEP-44/46 background auto-updates and environment-controlled opt-in contribution telemetry across standalone and connector deployments.
+- **Validation:** Connector suite passes (14 tests).
+- **Deployment:** None; pinned in the Armiger container image.
+- **Next step:** Pin merged connector revision in `spencernorton/Armiger`.
+- **Status file updated:** Yes.
+
 ## 2026-10-24 — NorviTechGH — Remove the DH-Waypoint connector
 
 - **Branch:** remove-dh-waypoint-connector

@@ -619,6 +619,16 @@ def test_installed_armiger_loader_uses_verified_data_without_cache_imports(monke
     result = module.load_armiger_classifier(tmp_path, auto_download=False)
     assert calls == [(tmp_path, {"variant": "ultra", "offline": True})]
     assert result[0] == tmp_path
-    assert result[1]["opt_in_sharing"] is False
-    assert result[1]["rsi_mode"] == "pull_only"
+    assert result[1]["opt_in_sharing"] is None
+    assert result[1]["rsi_mode"] is None
     assert sys.path == before
+
+    bm_conn = BitmagnetConnector(SyntheticArmigerClassifier())
+    bm_health = bm_conn.health_payload()
+    for key in ("active_seq", "active_bundle_merkle_root", "model_source", "last_dht_check_ts", "sharing_status"):
+        assert key in bm_health
+
+    rs_conn = RatsSearchConnector(SyntheticArmigerClassifier())
+    rs_health = rs_conn.health_payload()
+    for key in ("active_seq", "active_bundle_merkle_root", "model_source", "last_dht_check_ts", "sharing_status"):
+        assert key in rs_health
