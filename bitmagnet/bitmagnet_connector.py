@@ -195,8 +195,9 @@ def load_armiger_classifier(
             preload_catalog = os.environ.get("ARMIGER_USE_ZERO_CUE_CATALOG", "true").lower() == "true"
         return ArmigerUltraPipeline.from_directory(
             mpath, variant=variant, preload_catalog=preload_catalog,
-            rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE", "pull_only"),
-            opt_in_sharing=False,
+            rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE") or None,
+            opt_in_sharing=None,
+            offline=not auto_download,
         )
     eff_repo = hf_repo or os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra")
     mpath = ensure_armiger_model_dir(model_dir, hf_repo=eff_repo, auto_download=auto_download)
@@ -211,7 +212,9 @@ def load_armiger_classifier(
             mpath,
             variant=variant,
             preload_catalog=preload_catalog,
-            rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE", "pull_only"),
+            rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE") or None,
+            opt_in_sharing=None,
+            offline=not auto_download,
         )
     from armiger_inference import ArmigerONNXClassifier
     onnx_name = "armiger.onnx" if (mpath / "armiger.onnx").exists() else "armiger.int8.onnx"
@@ -764,7 +767,7 @@ class BitmagnetConnector:
 
     def health_payload(self) -> Dict[str, Any]:
         clf = self.classifier
-        return {
+        payload: Dict[str, Any] = {
             "status": "ok",
             "connector": "bitmagnet",
             "pipeline": type(clf).__name__,
@@ -772,6 +775,17 @@ class BitmagnetConnector:
             "zeroCueCatalogLoaded": bool(getattr(clf, "_zero_cue_catalog", None) is not None),
             "swarmAdapterLoaded": bool(hasattr(getattr(clf, "swarm_adapter", None), "junk_encoder")),
         }
+        if hasattr(clf, "health_status"):
+            payload.update(clf.health_status())
+        else:
+            payload.update({
+                "active_seq": int(getattr(clf, "active_seq", 0)),
+                "active_bundle_merkle_root": getattr(clf, "active_bundle_merkle_root", None),
+                "model_source": str(getattr(clf, "model_source", "baked_image")),
+                "last_dht_check_ts": getattr(clf, "last_dht_check_ts", None),
+                "sharing_status": clf.sharing_status() if hasattr(clf, "sharing_status") else None,
+            })
+        return payload
 
 
 def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: int = 8096) -> ThreadingHTTPServer:

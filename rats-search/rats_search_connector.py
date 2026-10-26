@@ -561,6 +561,29 @@ class RatsSearchConnector:
         return evaluation
 
 
+    def health_payload(self) -> Dict[str, Any]:
+        clf = self.classifier
+        payload: Dict[str, Any] = {
+            "status": "ok",
+            "connector": "rats-search",
+            "pipeline": type(clf).__name__,
+            "variant": str(getattr(clf, "variant", os.environ.get("ARMIGER_VARIANT", "ultra"))),
+            "zeroCueCatalogLoaded": bool(getattr(clf, "_zero_cue_catalog", None) is not None),
+            "swarmAdapterLoaded": bool(hasattr(getattr(clf, "swarm_adapter", None), "junk_encoder")),
+        }
+        if hasattr(clf, "health_status"):
+            payload.update(clf.health_status())
+        else:
+            payload.update({
+                "active_seq": int(getattr(clf, "active_seq", 0)),
+                "active_bundle_merkle_root": getattr(clf, "active_bundle_merkle_root", None),
+                "model_source": str(getattr(clf, "model_source", "baked_image")),
+                "last_dht_check_ts": getattr(clf, "last_dht_check_ts", None),
+                "sharing_status": clf.sharing_status() if hasattr(clf, "sharing_status") else None,
+            })
+        return payload
+
+
 def create_server(connector: RatsSearchConnector, host: str = "127.0.0.1", port: int = 8097) -> ThreadingHTTPServer:
     """Create a lightweight HTTP server exposing `/healthz` and `/v1/rats-search/classify`."""
 
@@ -575,7 +598,7 @@ def create_server(connector: RatsSearchConnector, host: str = "127.0.0.1", port:
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
-                self._send_json(200, {"status": "ok", "connector": "rats-search"})
+                self._send_json(200, connector.health_payload())
             else:
                 self._send_json(404, {"error": "not_found"})
 
