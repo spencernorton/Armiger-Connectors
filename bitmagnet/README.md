@@ -31,3 +31,5 @@ Configure your indexer client with
 `armiger-*` tags within Bitmagnet's 30-character limit. Malware pruning defaults
 on; dead-swarm deletion defaults off. Torznab dead-swarm filtering is controlled
 separately by `ARMIGER_REJECT_DEAD_SWARMS` (default `true`).
+
+Stock Bitmagnet flushes newly crawled DHT torrents in batches of up to 1,000 items or every 60 seconds. The poller (`BITMAGNET_POLL_SECONDS=5`, `BITMAGNET_BATCH_SIZE=100`) pages past items already tagged earlier in the active flush until the full wave is classified.

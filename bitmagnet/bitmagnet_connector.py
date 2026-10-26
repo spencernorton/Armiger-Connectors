@@ -46,6 +46,7 @@ GRAPHQL_RECENT_TORRENTS_QUERY = """
 query ArmigerRecentTorrents($input: TorrentContentSearchQueryInput!) {
   torrentContent {
     search(input: $input) {
+      hasNextPage
       items {
         infoHash
         contentType
@@ -467,6 +468,7 @@ class BitmagnetConnector(ClassifierConnector):
         self.reject_dead_swarms = reject_dead_swarms
         self.max_seen_cache = max_seen_cache
         self._seen: OrderedDict[str, None] = OrderedDict()
+        self._wave_seen: set[str] = set()
 
     @staticmethod
     def _default_graphql_transport(url: str, payload: Mapping[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
@@ -668,40 +670,93 @@ class BitmagnetConnector(ClassifierConnector):
             "graphqlPutTagsMutations": put_tags_mutations,
         }
 
-    def sync_once(self, limit: int = 100, apply_mutations: bool = True) -> Dict[str, Any]:
+    def sync_once(self, limit: int = 100, apply_mutations: bool = True, max_pages: int = 12) -> Dict[str, Any]:
         """Poll recent torrents from stock Bitmagnet GraphQL, classify untagged items, and apply mutations."""
-        search_payload = {
-            "query": GRAPHQL_RECENT_TORRENTS_QUERY,
-            "variables": {
-                "input": {
-                    "limit": int(limit),
-                    "orderBy": [{"field": "updated_at", "descending": True}],
-                }
-            },
-        }
-        resp = self._transport(self.graphql_url, search_payload)
-        raw_items = (
-            resp.get("data", {})
-            .get("torrentContent", {})
-            .get("search", {})
-            .get("items", [])
-        )
-
+        page_limit = max(1, int(limit))
+        max_scan_pages = max(1, int(max_pages))
         untagged_items: List[Mapping[str, Any]] = []
         need_files_hashes: List[str] = []
+        queued_hashes: set[str] = set()
+        above_wave_hashes: List[str] = []
 
-        for item in raw_items:
-            t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
-            ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
-            if not ih or ih in self._seen:
-                continue
-            existing_tags = t_obj.get("tagNames") or []
-            if any(str(t).startswith(("armiger-", "armiger:")) for t in existing_tags):
-                self._mark_seen(ih)
-                continue
-            untagged_items.append(item)
-            if bool(t_obj.get("hasFilesInfo")) and int(t_obj.get("filesCount") or 0) > 0:
-                need_files_hashes.append(ih)
+        offset = 0
+        pages_scanned = 0
+        wave_complete = False
+
+        while len(untagged_items) < page_limit and pages_scanned < max_scan_pages:
+            search_input: Dict[str, Any] = {
+                "limit": page_limit,
+                "hasNextPage": True,
+                "orderBy": [{"field": "updated_at", "descending": True}],
+            }
+            if offset > 0:
+                search_input["offset"] = offset
+            search_payload = {
+                "query": GRAPHQL_RECENT_TORRENTS_QUERY,
+                "variables": {"input": search_input},
+            }
+            resp = self._transport(self.graphql_url, search_payload)
+            search_data = (
+                resp.get("data", {})
+                .get("torrentContent", {})
+                .get("search", {})
+            ) or {}
+            raw_items = search_data.get("items") or []
+            pages_scanned += 1
+
+            if not raw_items:
+                wave_complete = True
+                break
+
+            page_untagged = 0
+            page_wave_seen = 0
+            pending_prior_hashes: List[str] = []
+
+            for item in raw_items:
+                t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
+                ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
+                if not ih or ih in queued_hashes:
+                    continue
+                existing_tags = t_obj.get("tagNames") or []
+                has_armiger_tag = any(str(t).startswith(("armiger-", "armiger:")) for t in existing_tags)
+                if ih in self._seen or has_armiger_tag:
+                    if has_armiger_tag:
+                        self._mark_seen(ih)
+                    if ih in self._wave_seen:
+                        page_wave_seen += 1
+                        if pending_prior_hashes:
+                            above_wave_hashes.extend(pending_prior_hashes)
+                            pending_prior_hashes.clear()
+                    else:
+                        pending_prior_hashes.append(ih)
+                    continue
+
+                if pending_prior_hashes:
+                    above_wave_hashes.extend(pending_prior_hashes)
+                    pending_prior_hashes.clear()
+                untagged_items.append(item)
+                queued_hashes.add(ih)
+                page_untagged += 1
+                if bool(t_obj.get("hasFilesInfo")) and int(t_obj.get("filesCount") or 0) > 0:
+                    need_files_hashes.append(ih)
+                if len(untagged_items) >= page_limit:
+                    break
+
+            if len(untagged_items) >= page_limit:
+                break
+
+            has_next = search_data.get("hasNextPage")
+            if has_next is None:
+                has_next = len(raw_items) >= page_limit
+
+            if not has_next or (page_untagged == 0 and page_wave_seen == 0) or len(pending_prior_hashes) > 0:
+                wave_complete = True
+                break
+
+            offset += len(raw_items)
+        else:
+            if len(untagged_items) < page_limit:
+                wave_complete = True
 
         files_by_hash: Dict[str, List[Dict[str, Any]]] = {}
         if need_files_hashes:
@@ -735,6 +790,19 @@ class BitmagnetConnector(ClassifierConnector):
                 self._transport(self.graphql_url, result["graphqlDeleteMutation"])
             for tag_mut in result["graphqlPutTagsMutations"]:
                 self._transport(self.graphql_url, tag_mut)
+
+        if wave_complete or not untagged_items:
+            self._wave_seen.clear()
+        else:
+            self._wave_seen.update(above_wave_hashes)
+            for act in result["actions"]:
+                act_ih = str(act.get("infoHash") or "").strip().lower()
+                if not act_ih:
+                    continue
+                if apply_mutations and act.get("action") == "delete":
+                    self._wave_seen.discard(act_ih)
+                else:
+                    self._wave_seen.add(act_ih)
         return result
 
     _extract_torznab_item_row = staticmethod(extract_torznab_item_row)

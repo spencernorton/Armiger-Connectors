@@ -1,3 +1,13 @@
+## 2026-10-26 — NorviTechGH — Paginate Bitmagnet poller across multi-batch crawl flushes
+
+- **Branch:** fix/bitmagnet-poller-pagination
+- **What changed:** Update `BitmagnetConnector.sync_once` to request `hasNextPage` and advance `offset` past items already tagged earlier in the current flush (`_wave_seen`) until `limit` untagged items are collected or the prior tagged frontier is reached. Exclude deleted hashes from `_wave_seen` so row shifts after `torrent.delete` never skip untagged entries across page boundaries.
+- **Why:** Stock Bitmagnet flushes crawled DHT torrents in bursts of up to 1,000 items or every 60 seconds, and `torrent.putTags` leaves newly tagged rows at the top of `updated_at DESC`. Without pagination, subsequent 5-second polls re-fetched `offset=0` and left items beyond the first `BITMAGNET_BATCH_SIZE` window untagged (`spencernorton/armiger#37`).
+- **Validation:** 43 tests pass (`python3 -m pytest -v`), including multi-poll 350-item flush pagination and deletion-shift regression coverage.
+- **Deployment:** None; pinned in `spencernorton/armiger`.
+- **Next step:** Tag `v1.2.3` and pin in `spencernorton/armiger`.
+- **Status file updated:** Yes.
+
 ## 2026-10-26 — codex — Consolidate shared runtime and simplify setup guides
 
 - **Branch:** codex/slim-connectors
