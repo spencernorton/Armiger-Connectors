@@ -254,6 +254,119 @@ def test_bitmagnet_sync_once_fetches_files_and_skips_already_tagged() -> None:
     assert len(calls) == 3
 
 
+def test_bitmagnet_sync_once_paginates_across_minute_flush_and_handles_deletes() -> None:
+    # Simulate stock Bitmagnet's 60s flush: 350 newly saved torrents (including 2 malware lures
+    # in the first page) sitting above 50 historical already-tagged torrents in `updated_at DESC`.
+    rows: List[Dict[str, Any]] = []
+    for idx in range(350):
+        ih = f"{idx + 1:040x}"
+        is_lure = idx in (10, 25)
+        name = f"Fake.Lure.{idx}.2025.1080p" if is_lure else f"Sintel.Part.{idx}.2010.1080p"
+        rows.append({
+            "infoHash": ih,
+            "contentType": None,
+            "title": name,
+            "seeders": 20,
+            "leechers": 2,
+            "torrent": {
+                "infoHash": ih,
+                "name": name,
+                "size": 15_000_000 if is_lure else 2_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": True,
+                "seeders": 20,
+                "leechers": 2,
+                "tagNames": [],
+            },
+            "_file_path": f"{name}.mkv.exe" if is_lure else f"{name}.mkv",
+        })
+    for idx in range(350, 400):
+        ih = f"{idx + 1:040x}"
+        rows.append({
+            "infoHash": ih,
+            "contentType": "movie",
+            "title": f"Historical.Movie.{idx}",
+            "seeders": 12,
+            "leechers": 1,
+            "torrent": {
+                "infoHash": ih,
+                "name": f"Historical.Movie.{idx}.1080p",
+                "size": 3_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 12,
+                "leechers": 1,
+                "tagNames": ["armiger-movie", "armiger-lang-english"],
+            },
+            "_file_path": f"Historical.Movie.{idx}.1080p.mkv",
+        })
+
+    search_offsets: List[int] = []
+
+    def fake_transport(url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        q = str(payload.get("query") or "")
+        variables = payload.get("variables") or {}
+        if "ArmigerRecentTorrents" in q:
+            inp = variables.get("input") or {}
+            lim = int(inp.get("limit") or 100)
+            off = int(inp.get("offset") or 0)
+            search_offsets.append(off)
+            page = rows[off : off + lim]
+            return {
+                "data": {
+                    "torrentContent": {
+                        "search": {
+                            "hasNextPage": (off + lim) < len(rows),
+                            "items": page,
+                        }
+                    }
+                }
+            }
+        if "ArmigerTorrentFiles" in q:
+            req_hashes = set((variables.get("input") or {}).get("infoHashes") or [])
+            file_items = [
+                {"infoHash": r["infoHash"], "path": r["_file_path"], "size": r["torrent"]["size"]}
+                for r in rows
+                if r["infoHash"] in req_hashes
+            ]
+            return {"data": {"torrent": {"files": {"items": file_items}}}}
+        if "TorrentDelete" in q:
+            del_hashes = set(variables.get("infoHashes") or [])
+            rows[:] = [r for r in rows if r["infoHash"] not in del_hashes]
+            return {"data": {"torrent": {"delete": None}}}
+        if "TorrentPutTags" in q:
+            tag_hashes = set(variables.get("infoHashes") or [])
+            new_tags = list(variables.get("tagNames") or [])
+            for r in rows:
+                if r["infoHash"] in tag_hashes:
+                    existing = list(r["torrent"].get("tagNames") or [])
+                    r["torrent"]["tagNames"] = list(dict.fromkeys(existing + new_tags))
+            return {"data": {"torrent": {"putTags": None}}}
+        return {"data": {}}
+
+    connector = BitmagnetConnector(SyntheticArmigerClassifier(), graphql_transport=fake_transport)
+
+    # 4 consecutive 5-second polls with batch_size=100 must drain all 350 new items (2 deleted, 348 tagged)
+    r1 = connector.sync_once(limit=100, apply_mutations=True)
+    r2 = connector.sync_once(limit=100, apply_mutations=True)
+    r3 = connector.sync_once(limit=100, apply_mutations=True)
+    r4 = connector.sync_once(limit=100, apply_mutations=True)
+
+    assert (r1["total"], r2["total"], r3["total"], r4["total"]) == (100, 100, 100, 50)
+    assert r1["deletedCount"] == 2
+    assert len(rows) == 398
+    assert all(
+        any(t.startswith("armiger-") for t in r["torrent"]["tagNames"])
+        for r in rows
+    )
+
+    # Once the 350-item wave hits the historical tagged frontier on Poll 4, Poll 5 does a single offset=0 check
+    search_offsets.clear()
+    r5 = connector.sync_once(limit=100, apply_mutations=True)
+    assert r5["total"] == 0
+    assert search_offsets == [0]
+
+
 def test_bitmagnet_http_server_endpoint() -> None:
     connector = BitmagnetConnector(SyntheticArmigerClassifier())
     srv = create_bitmagnet_server(connector, host="127.0.0.1", port=0)
