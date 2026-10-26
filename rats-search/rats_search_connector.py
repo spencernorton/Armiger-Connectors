@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal, high-efficiency Armiger connector for stock upstream `librats/rats-search`.
-
-Integrates with unmodified `librats/rats-search` (`v2.3.5+`) through its built-in
-REST API (`http://localhost:8095`), WebSocket broadcast stream (`ws://localhost:8096`),
-and embedded Manticore RT index (`127.0.0.1:9306`):
-  1. Polls `/api/search.recent` or listens for WebSocket `torrentIndexed` /
-     `filesReady` push events, enriching multi-file items via `/api/torrent.get?files=true`.
-  2. Runs a single vectorized Armiger batch inference pass (`ArmigerONNXClassifier`
-     or `ArmigerUltraPipeline`).
-  3. Purges disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`),
-     safety-gate violations, and fake-seeder honeypot traps via
-     `/api/torrent.remove` so `TorrentRepository`'s in-memory statistics stay
-     synchronized.
-  4. Populates `rats-search`'s `contentType` and `contentCategory` (`Movie=1` ..
-     `Game=9`, `XXX=100`) columns in the Manticore `torrents` RT table using
-     `rats-search`'s deterministic 63-bit `rowIdFromHash` docid lookup (`O(1)`)
-     over a zero-dependency pure-Python `mysql41` wire-protocol client.
-"""
+"""Armiger classification for stock Rats Search over REST, WebSocket events and Manticore."""
 from __future__ import annotations
 
 from collections import OrderedDict
 from enum import IntEnum
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -41,9 +24,9 @@ if str(_CONNECTOR_ROOT / "bitmagnet") not in sys.path:
     sys.path.insert(0, str(_CONNECTOR_ROOT / "bitmagnet"))
 
 from bitmagnet_connector import (  # noqa: E402
-    has_disguised_executable,
     load_armiger_classifier,
-    normalize_prediction,
+    ClassifierConnector,
+    JSONHandler,
 )
 
 
@@ -220,8 +203,10 @@ def execute_manticore_mysql41(host: str, port: int, sql: str, timeout: float = 5
         return rows
 
 
-class RatsSearchConnector:
+class RatsSearchConnector(ClassifierConnector):
     """Minimal, high-efficiency connector for stock upstream `librats/rats-search`."""
+
+    connector_name = "rats-search"
 
     def __init__(
         self,
@@ -292,27 +277,6 @@ class RatsSearchConnector:
             return []
         headers = lines[0].split("	")
         return [dict(zip(headers, ln.split("	"))) for ln in lines[1:]]
-
-    def _mark_seen(self, infohash: str) -> None:
-        if not infohash:
-            return
-        self._seen[infohash] = None
-        self._seen.move_to_end(infohash)
-        while len(self._seen) > self.max_seen_cache:
-            self._seen.popitem(last=False)
-
-    def _run_batch_inference(self, rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-        if not rows:
-            return []
-        if hasattr(self.classifier, "classify_batch"):
-            raw_preds = self.classifier.classify_batch(rows)
-        elif hasattr(self.classifier, "predict_batch"):
-            raw_preds = self.classifier.predict_batch(rows)
-        elif hasattr(self.classifier, "classify"):
-            raw_preds = [self.classifier.classify(r) for r in rows]
-        else:
-            raw_preds = [self.classifier.predict(r) for r in rows]
-        return [normalize_prediction(p, r) for p, r in zip(raw_preds, rows)]
 
     @staticmethod
     def _rats_item_to_row(item: Mapping[str, Any]) -> Dict[str, Any]:
@@ -561,41 +525,10 @@ class RatsSearchConnector:
         return evaluation
 
 
-    def health_payload(self) -> Dict[str, Any]:
-        clf = self.classifier
-        payload: Dict[str, Any] = {
-            "status": "ok",
-            "connector": "rats-search",
-            "pipeline": type(clf).__name__,
-            "variant": str(getattr(clf, "variant", os.environ.get("ARMIGER_VARIANT", "ultra"))),
-            "zeroCueCatalogLoaded": bool(getattr(clf, "_zero_cue_catalog", None) is not None),
-            "swarmAdapterLoaded": bool(hasattr(getattr(clf, "swarm_adapter", None), "junk_encoder")),
-        }
-        if hasattr(clf, "health_status"):
-            payload.update(clf.health_status())
-        else:
-            payload.update({
-                "active_seq": int(getattr(clf, "active_seq", 0)),
-                "active_bundle_merkle_root": getattr(clf, "active_bundle_merkle_root", None),
-                "model_source": str(getattr(clf, "model_source", "baked_image")),
-                "last_dht_check_ts": getattr(clf, "last_dht_check_ts", None),
-                "sharing_status": clf.sharing_status() if hasattr(clf, "sharing_status") else None,
-            })
-        return payload
-
-
 def create_server(connector: RatsSearchConnector, host: str = "127.0.0.1", port: int = 8097) -> ThreadingHTTPServer:
     """Create a lightweight HTTP server exposing `/healthz` and `/v1/rats-search/classify`."""
 
-    class Handler(BaseHTTPRequestHandler):
-        def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
+    class Handler(JSONHandler):
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 self._send_json(200, connector.health_payload())
@@ -614,9 +547,6 @@ def create_server(connector: RatsSearchConnector, host: str = "127.0.0.1", port:
                 self._send_json(200, result)
             else:
                 self._send_json(404, {"error": "not_found"})
-
-        def log_message(self, fmt: str, *args: Any) -> None:
-            return
 
     return ThreadingHTTPServer((host, port), Handler)
 

@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
-"""Turnkey Armiger & Armiger Ultra connector for stock upstream Bitmagnet.
-
-Works with unmodified `bitmagnet-io/bitmagnet` via its standard GraphQL API
-(`http://localhost:3333/graphql`) and Torznab feed (`http://localhost:3333/torznab`):
-  1. Auto-bootstraps `NorviTech/armiger-ultra` (`ArmigerUltraPipeline` 9-head RoPE
-     Transformer + 6 plugins) from Hugging Face when `ARMIGER_AUTO_DOWNLOAD=true`
-     and `ARMIGER_MODEL_DIR` is not yet populated.
-  2. Queries newly indexed torrents (`torrentContent.search`) and skips items
-     that already carry an `armiger-*` tag.
-  3. Batch-fetches inner file lists in a single `torrent.files` GraphQL call.
-  4. Runs a single vectorized Armiger Ultra batch inference pass (`ArmigerUltraPipeline`
-     or `ArmigerONNXClassifier`).
-  5. Prunes disguised executable lures (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`),
-     CSAM/safety-gate failures, and fake-seeder honeypot traps in one batched
-     `torrent.delete(infoHashes: $infoHashes)` mutation.
-  6. Enriches surviving torrents by grouping hashes that share the same kebab-case
-     tag set (`^[a-z0-9]+(-[a-z0-9]+)*$`) into minimal batched
-     `torrent.putTags(infoHashes: $infoHashes, tagNames: $tagNames)` mutations.
-  7. Exposes `/healthz`, `POST /v1/bitmagnet/classify`, and a pre-grab Torznab XML
-     filtering proxy (`/torznab` on `:8096` and `:8097`) for Prowlarr / `*Arr`.
-"""
+"""Armiger classification, GraphQL sync and Torznab filtering for stock Bitmagnet."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -177,6 +157,7 @@ def load_armiger_classifier(
     preload_catalog: Optional[bool] = None,
     auto_download: bool = False,
     hf_repo: Optional[str] = None,
+    opt_in_sharing: Optional[bool] = None,
 ) -> Any:
     """Load `ArmigerUltraPipeline` if present in `model_dir`, else `ArmigerONNXClassifier`."""
     # Installed Armiger owns code and verified data downloads. Never import code
@@ -196,7 +177,7 @@ def load_armiger_classifier(
         return ArmigerUltraPipeline.from_directory(
             mpath, variant=variant, preload_catalog=preload_catalog,
             rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE") or None,
-            opt_in_sharing=None,
+            opt_in_sharing=opt_in_sharing,
             offline=not auto_download,
         )
     eff_repo = hf_repo or os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra")
@@ -213,7 +194,7 @@ def load_armiger_classifier(
             variant=variant,
             preload_catalog=preload_catalog,
             rsi_mode=os.environ.get("ARMIGER_DHT_RSI_MODE") or None,
-            opt_in_sharing=None,
+            opt_in_sharing=opt_in_sharing,
             offline=not auto_download,
         )
     from armiger_inference import ArmigerONNXClassifier
@@ -252,40 +233,24 @@ def _head_label(heads: Any, key: str, default: str) -> str:
 
 def normalize_prediction(pred: Any, row: Mapping[str, Any]) -> Dict[str, Any]:
     """Normalize either an `ArmigerUltraPrediction` object or an `ArmigerONNXClassifier` dict."""
-    if isinstance(pred, Mapping):
-        heads = pred.get("heads", {})
-        category = str(pred.get("category") or _head_label(heads, "category", "unknown"))
-        adult = str(pred.get("adult") or _head_label(heads, "adult", "non_adult"))
-        junk = str(pred.get("junk") or _head_label(heads, "junk", "clean"))
-        anime = str(pred.get("anime") or _head_label(heads, "anime", "non_anime"))
-        lang = str(pred.get("lang") or _head_label(heads, "lang", "multi_or_unknown"))
-        eng_subs = str(pred.get("english_subs") or _head_label(heads, "english_subs", "unknown"))
-        title_lang = str(pred.get("title_language") or _head_label(heads, "title_language", "english_title"))
-        owner_scope = str(pred.get("owner_scope") or _head_label(heads, "owner_scope", "allowed_type"))
-        gates = pred.get("mondrian_gates", {})
-        csam_safe = bool(pred.get("csam_safety", {}).get("is_safe", True))
-        honeypot = bool(pred.get("honeypot_trap", {}).get("is_honeypot_trap", False))
-        sw_obj = pred.get("swarm_viability", {}) if isinstance(pred.get("swarm_viability"), Mapping) else {}
-        viability_tier = str(sw_obj.get("viability_tier", "unknown"))
-        viability_prob = float(sw_obj.get("viability_prob", 0.5))
-        survival_net_prob = float(sw_obj.get("survival_net_prob", viability_prob))
-    else:
-        category = str(pred.category)
-        heads = getattr(pred, "heads", {})
-        adult = str(pred.adult)
-        junk = str(pred.junk)
-        anime = str(pred.anime)
-        lang = str(pred.lang)
-        eng_subs = str(pred.english_subs)
-        title_lang = str(getattr(pred, "title_language", _head_label(heads, "title_language", "english_title")))
-        owner_scope = str(getattr(pred, "owner_scope", _head_label(heads, "owner_scope", "allowed_type")))
-        gates = getattr(pred, "mondrian_gates", {})
-        csam_safe = bool(getattr(pred, "csam_safety", {}).get("is_safe", True))
-        honeypot = bool(getattr(pred, "honeypot_trap", {}).get("is_honeypot_trap", False))
-        sw_obj = getattr(pred, "swarm_viability", {}) or {}
-        viability_tier = str(sw_obj.get("viability_tier", "unknown"))
-        viability_prob = float(sw_obj.get("viability_prob", 0.5))
-        survival_net_prob = float(sw_obj.get("survival_net_prob", viability_prob))
+    get = pred.get if isinstance(pred, Mapping) else lambda key, default=None: getattr(pred, key, default)
+    heads = get("heads", {})
+    category = str(get("category") or _head_label(heads, "category", "unknown"))
+    adult = str(get("adult") or _head_label(heads, "adult", "non_adult"))
+    junk = str(get("junk") or _head_label(heads, "junk", "clean"))
+    anime = str(get("anime") or _head_label(heads, "anime", "non_anime"))
+    lang = str(get("lang") or _head_label(heads, "lang", "multi_or_unknown"))
+    eng_subs = str(get("english_subs") or _head_label(heads, "english_subs", "unknown"))
+    title_lang = str(get("title_language") or _head_label(heads, "title_language", "english_title"))
+    owner_scope = str(get("owner_scope") or _head_label(heads, "owner_scope", "allowed_type"))
+    gates = get("mondrian_gates", {})
+    csam_safe = bool(get("csam_safety", {}).get("is_safe", True))
+    honeypot = bool(get("honeypot_trap", {}).get("is_honeypot_trap", False))
+    sw_obj = get("swarm_viability")
+    sw_obj = sw_obj if isinstance(sw_obj, Mapping) else {}
+    viability_tier = str(sw_obj.get("viability_tier", "unknown"))
+    viability_prob = float(sw_obj.get("viability_prob", 0.5))
+    survival_net_prob = float(sw_obj.get("survival_net_prob", viability_prob))
 
     disguised_exec = has_disguised_executable(
         str(row.get("name") or ""),
@@ -319,8 +284,161 @@ def normalize_prediction(pred: Any, row: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-class BitmagnetConnector:
+def extract_torznab_item_row(item_elem: ET.Element) -> Dict[str, Any]:
+    title = (item_elem.findtext("title") or "").strip()
+    size_text = item_elem.findtext("size") or "0"
+    try:
+        size_val = int(size_text)
+    except ValueError:
+        size_val = 0
+
+    attrs: Dict[str, str] = {}
+    for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr"):
+        name = (attr.attrib.get("name") or "").lower().strip()
+        val = attr.attrib.get("value") or ""
+        if name:
+            attrs[name] = val
+
+    seeders = int(attrs.get("seeders", "0") or 0)
+    peers = int(attrs.get("peers", "0") or 0)
+    leechers = max(peers - seeders, int(attrs.get("leechers", "0") or 0))
+    grabs = int(attrs["grabs"]) if "grabs" in attrs and attrs["grabs"].strip() else None
+    infohash = attrs.get("infohash") or ""
+
+    files_attr = attrs.get("files") or ""
+    # Torznab defines `files` as a file count, which carries no paths.
+    if files_attr and not files_attr.strip().isdigit():
+        files = [{"path": p.strip(), "size": size_val} for p in files_attr.split(";") if p.strip()]
+    else:
+        tail = title.rsplit(".", 1)[-1].lower() if "." in title else ""
+        known_exts = {
+            "mkv", "mp4", "avi", "flac", "mp3", "m4b", "epub", "pdf",
+            "cbz", "cbr", "iso", "exe", "scr", "vbs", "bat", "cmd", "lnk", "ps1", "msi",
+        }
+        if tail in known_exts:
+            files = [{"path": title, "size": size_val}]
+        else:
+            low = title.lower()
+            if any(k in low for k in ("flac", "24bit", "lossless")):
+                synth_ext = ".flac"
+            elif any(k in low for k in ("m4b", "audiobook", "unabridged")):
+                synth_ext = ".m4b"
+            elif any(k in low for k in ("epub", "ebook")):
+                synth_ext = ".epub"
+            elif any(k in low for k in ("cbz", "cbr")):
+                synth_ext = ".cbz"
+            else:
+                synth_ext = ".mkv"
+            files = [{"path": f"{title}{synth_ext}", "size": size_val}]
+
+    return {
+        "infohash": infohash,
+        "name": title,
+        "size": size_val,
+        "files": files,
+        "file_count": len(files),
+        "swarm": {
+            "tracker_known": bool(seeders > 0 or leechers > 0 or "seeders" in attrs),
+            "tracker_seeders": seeders,
+            "tracker_leechers": leechers,
+            "tracker_completed": grabs,
+        },
+    }
+
+
+def filter_torznab_feed(
+    xml_bytes: bytes,
+    extract_row: Callable[[ET.Element], Dict[str, Any]],
+    classify: Callable[[List[Dict[str, Any]]], Sequence[Any]],
+    should_admit: Callable[[Any], Tuple[bool, str]],
+    attributes: Callable[[Any], Sequence[Tuple[str, Any]]],
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Filter a feed once, with connector-specific admission and annotation hooks."""
+    root = ET.fromstring(xml_bytes)
+    channel = root.find("channel")
+    items = [] if channel is None else channel.findall("item")
+    stats = {"total": len(items), "admitted": 0, "blocked": 0, "blocked_reasons": {}}
+    if not items:
+        return xml_bytes, stats
+    predictions = classify([extract_row(item) for item in items])
+    for item, pred in zip(items, predictions):
+        admit, reason = should_admit(pred)
+        if not admit:
+            channel.remove(item)
+            stats["blocked"] += 1
+            reasons = stats["blocked_reasons"]
+            reasons[reason] = reasons.get(reason, 0) + 1
+            continue
+        stats["admitted"] += 1
+        for name, value in attributes(pred):
+            ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", name=name, value=str(value))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True), stats
+
+
+class JSONHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+
+class ClassifierConnector:
+    """Shared inference, health reporting and bounded seen cache."""
+
+    def _mark_seen(self, infohash: str) -> None:
+        if not infohash:
+            return
+        self._seen[infohash] = None
+        self._seen.move_to_end(infohash)
+        while len(self._seen) > self.max_seen_cache:
+            self._seen.popitem(last=False)
+
+    def _run_batch_inference(self, rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        if not rows:
+            return []
+        if hasattr(self.classifier, "classify_batch"):
+            raw_preds = self.classifier.classify_batch(rows)
+        elif hasattr(self.classifier, "predict_batch"):
+            raw_preds = self.classifier.predict_batch(rows)
+        elif hasattr(self.classifier, "classify"):
+            raw_preds = [self.classifier.classify(r) for r in rows]
+        else:
+            raw_preds = [self.classifier.predict(r) for r in rows]
+        return [normalize_prediction(p, r) for p, r in zip(raw_preds, rows)]
+
+    def health_payload(self) -> Dict[str, Any]:
+        clf = self.classifier
+        payload: Dict[str, Any] = {
+            "status": "ok",
+            "connector": self.connector_name,
+            "pipeline": type(clf).__name__,
+            "variant": str(getattr(clf, "variant", os.environ.get("ARMIGER_VARIANT", "ultra"))),
+            "zeroCueCatalogLoaded": bool(getattr(clf, "_zero_cue_catalog", None) is not None),
+            "swarmAdapterLoaded": bool(hasattr(getattr(clf, "swarm_adapter", None), "junk_encoder")),
+        }
+        if hasattr(clf, "health_status"):
+            payload.update(clf.health_status())
+        else:
+            payload.update({
+                "active_seq": int(getattr(clf, "active_seq", 0)),
+                "active_bundle_merkle_root": getattr(clf, "active_bundle_merkle_root", None),
+                "model_source": str(getattr(clf, "model_source", "baked_image")),
+                "last_dht_check_ts": getattr(clf, "last_dht_check_ts", None),
+                "sharing_status": clf.sharing_status() if hasattr(clf, "sharing_status") else None,
+            })
+        return payload
+
+
+class BitmagnetConnector(ClassifierConnector):
     """Turnkey connector & Torznab pre-grab filter for stock upstream `bitmagnet-io/bitmagnet`."""
+
+    connector_name = "bitmagnet"
 
     def __init__(
         self,
@@ -363,27 +481,6 @@ class BitmagnetConnector:
         if isinstance(parsed, Mapping) and parsed.get("errors"):
             raise RuntimeError(f"Bitmagnet GraphQL error: {parsed['errors']}")
         return parsed
-
-    def _mark_seen(self, infohash: str) -> None:
-        if not infohash:
-            return
-        self._seen[infohash] = None
-        self._seen.move_to_end(infohash)
-        while len(self._seen) > self.max_seen_cache:
-            self._seen.popitem(last=False)
-
-    def _run_batch_inference(self, rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-        if not rows:
-            return []
-        if hasattr(self.classifier, "classify_batch"):
-            raw_preds = self.classifier.classify_batch(rows)
-        elif hasattr(self.classifier, "predict_batch"):
-            raw_preds = self.classifier.predict_batch(rows)
-        elif hasattr(self.classifier, "classify"):
-            raw_preds = [self.classifier.classify(r) for r in rows]
-        else:
-            raw_preds = [self.classifier.predict(r) for r in rows]
-        return [normalize_prediction(p, r) for p, r in zip(raw_preds, rows)]
 
     @staticmethod
     def _item_to_row(item: Mapping[str, Any], files_by_hash: Optional[Mapping[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
@@ -640,67 +737,7 @@ class BitmagnetConnector:
                 self._transport(self.graphql_url, tag_mut)
         return result
 
-    @staticmethod
-    def _extract_torznab_item_row(item_elem: ET.Element) -> Dict[str, Any]:
-        title = (item_elem.findtext("title") or "").strip()
-        size_text = item_elem.findtext("size") or "0"
-        try:
-            size_val = int(size_text)
-        except ValueError:
-            size_val = 0
-
-        attrs: Dict[str, str] = {}
-        for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr"):
-            name = (attr.attrib.get("name") or "").lower().strip()
-            val = attr.attrib.get("value") or ""
-            if name:
-                attrs[name] = val
-
-        seeders = int(attrs.get("seeders", "0") or 0)
-        peers = int(attrs.get("peers", "0") or 0)
-        leechers = max(peers - seeders, int(attrs.get("leechers", "0") or 0))
-        grabs = int(attrs["grabs"]) if "grabs" in attrs and attrs["grabs"].strip() else None
-        infohash = attrs.get("infohash") or ""
-
-        files_attr = attrs.get("files") or ""
-        # Torznab defines `files` as a file count, which carries no paths.
-        if files_attr and not files_attr.strip().isdigit():
-            files = [{"path": p.strip(), "size": size_val} for p in files_attr.split(";") if p.strip()]
-        else:
-            tail = title.rsplit(".", 1)[-1].lower() if "." in title else ""
-            known_exts = {
-                "mkv", "mp4", "avi", "flac", "mp3", "m4b", "epub", "pdf",
-                "cbz", "cbr", "iso", "exe", "scr", "vbs", "bat", "cmd", "lnk", "ps1", "msi",
-            }
-            if tail in known_exts:
-                files = [{"path": title, "size": size_val}]
-            else:
-                low = title.lower()
-                if any(k in low for k in ("flac", "24bit", "lossless")):
-                    synth_ext = ".flac"
-                elif any(k in low for k in ("m4b", "audiobook", "unabridged")):
-                    synth_ext = ".m4b"
-                elif any(k in low for k in ("epub", "ebook")):
-                    synth_ext = ".epub"
-                elif any(k in low for k in ("cbz", "cbr")):
-                    synth_ext = ".cbz"
-                else:
-                    synth_ext = ".mkv"
-                files = [{"path": f"{title}{synth_ext}", "size": size_val}]
-
-        return {
-            "infohash": infohash,
-            "name": title,
-            "size": size_val,
-            "files": files,
-            "file_count": len(files),
-            "swarm": {
-                "tracker_known": bool(seeders > 0 or leechers > 0 or "seeders" in attrs),
-                "tracker_seeders": seeders,
-                "tracker_leechers": leechers,
-                "tracker_completed": grabs,
-            },
-        }
+    _extract_torznab_item_row = staticmethod(extract_torznab_item_row)
 
     def should_admit_torznab(self, pred: Mapping[str, Any]) -> Tuple[bool, str]:
         """Evaluate whether a Torznab XML item should be admitted to Prowlarr / `*Arr`."""
@@ -719,87 +756,22 @@ class BitmagnetConnector:
         return True, "admitted"
 
     def filter_torznab_xml(self, xml_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
-        """Filter blocked `<item>` nodes from Bitmagnet Torznab XML and attach `armiger_*` attributes."""
-        root = ET.fromstring(xml_bytes)
-        channel = root.find("channel")
-        if channel is None:
-            return xml_bytes, {"total": 0, "admitted": 0, "blocked": 0, "blocked_reasons": {}}
-
-        items = channel.findall("item")
-        if not items:
-            return xml_bytes, {"total": 0, "admitted": 0, "blocked": 0, "blocked_reasons": {}}
-
-        rows = [self._extract_torznab_item_row(it) for it in items]
-        preds = self._run_batch_inference(rows)
-
-        admitted_count = 0
-        blocked_count = 0
-        blocked_reasons: Dict[str, int] = {}
-
-        for item_elem, pred in zip(items, preds):
-            admit, reason = self.should_admit_torznab(pred)
-            if not admit:
-                channel.remove(item_elem)
-                blocked_count += 1
-                blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
-                continue
-
-            admitted_count += 1
-            for attr_name, attr_val in (
-                ("armiger_category", str(pred["category"])),
-                ("armiger_lang", str(pred["lang"])),
-                ("armiger_title_lang", str(pred.get("title_language", "english_title"))),
-                ("armiger_viability", str(pred["viability_tier"])),
+        return filter_torznab_feed(
+            xml_bytes, self._extract_torznab_item_row, self._run_batch_inference,
+            self.should_admit_torznab,
+            lambda pred: (
+                ("armiger_category", pred["category"]),
+                ("armiger_lang", pred["lang"]),
+                ("armiger_title_lang", pred.get("title_language", "english_title")),
+                ("armiger_viability", pred["viability_tier"]),
                 ("armiger_survival_prob", f"{float(pred.get('survival_net_prob', pred['viability_prob'])):.4f}"),
-            ):
-                attr_el = ET.SubElement(item_elem, f"{{{TORZNAB_NS}}}attr")
-                attr_el.set("name", attr_name)
-                attr_el.set("value", attr_val)
-
-        filtered_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        stats = {
-            "total": len(items),
-            "admitted": admitted_count,
-            "blocked": blocked_count,
-            "blocked_reasons": blocked_reasons,
-        }
-        return filtered_bytes, stats
-
-    def health_payload(self) -> Dict[str, Any]:
-        clf = self.classifier
-        payload: Dict[str, Any] = {
-            "status": "ok",
-            "connector": "bitmagnet",
-            "pipeline": type(clf).__name__,
-            "variant": str(getattr(clf, "variant", os.environ.get("ARMIGER_VARIANT", "ultra"))),
-            "zeroCueCatalogLoaded": bool(getattr(clf, "_zero_cue_catalog", None) is not None),
-            "swarmAdapterLoaded": bool(hasattr(getattr(clf, "swarm_adapter", None), "junk_encoder")),
-        }
-        if hasattr(clf, "health_status"):
-            payload.update(clf.health_status())
-        else:
-            payload.update({
-                "active_seq": int(getattr(clf, "active_seq", 0)),
-                "active_bundle_merkle_root": getattr(clf, "active_bundle_merkle_root", None),
-                "model_source": str(getattr(clf, "model_source", "baked_image")),
-                "last_dht_check_ts": getattr(clf, "last_dht_check_ts", None),
-                "sharing_status": clf.sharing_status() if hasattr(clf, "sharing_status") else None,
-            })
-        return payload
-
+            ),
+        )
 
 def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: int = 8096) -> ThreadingHTTPServer:
     """Create a lightweight HTTP server exposing `/healthz`, `/v1/bitmagnet/classify`, and `/torznab`."""
 
-    class Handler(BaseHTTPRequestHandler):
-        def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
+    class Handler(JSONHandler):
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 self._send_json(200, connector.health_payload())
@@ -855,9 +827,6 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
                 self._send_json(200, result)
             else:
                 self._send_json(404, {"error": "not_found"})
-
-        def log_message(self, fmt: str, *args: Any) -> None:
-            return
 
     return ThreadingHTTPServer((host, port), Handler)
 

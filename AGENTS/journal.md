@@ -1,3 +1,13 @@
+## 2026-10-26 — codex — Consolidate shared runtime and simplify setup guides
+
+- **Branch:** codex/slim-connectors
+- **What changed:** Share classifier dispatch, seen-cache handling, health reporting, JSON responses, Torznab parsing and feed filtering. Both Arr services use the common installed/legacy model loader; Compose no longer duplicates model downloads. Shorten repeated setup prose while retaining all three integrations.
+- **Comparison:** ApolloF/main is upstream v1.1.0 (395e4c8), with no unique commits. Preserve subsequent upstream fixes.
+- **Validation:** 42 tests; 2,000 prediction cases match v1.2.1; Ruff, Compose configuration, embedded bootstrap syntax and Python 3.10 syntax pass.
+- **Deployment:** None. Source version 1.2.2; model artifacts and inference are unchanged.
+- **Next step:** Complete protected CI and release.
+- **Status file updated:** Companion status update prepared.
+
 ## 2026-10-26 — NorviTechGH — Wire DHT auto-update observability and environment-resolved opt-in sharing
 
 - **Branch:** feat/dht-autoupdate-and-sharing-status

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "armiger-connectors"
-version = "1.2.0"
+version = "1.2.2"
 description = "Turnkey connectors integrating Armiger and Armiger Ultra with Bitmagnet, Rats Search, and the *Arr Stack."
 readme = "README.md"
 license = {text = "Apache-2.0"}
