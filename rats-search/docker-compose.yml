@@ -33,19 +33,14 @@ services:
         pip install --no-cache-dir --quiet numpy onnxruntime cryptography huggingface_hub
         pip install --no-cache-dir --quiet --index-url https://download.pytorch.org/whl/cpu torch || true
         python3 -c '
-        import os, urllib.request
+        import urllib.request
         from pathlib import Path
-        from huggingface_hub import snapshot_download
         base = "https://raw.githubusercontent.com/spencernorton/Armiger-Connectors/main"
         for sub, fn in (("bitmagnet", "bitmagnet_connector.py"), ("rats-search", "rats_search_connector.py")):
             dst = Path("/var/lib/armiger") / sub / fn
             dst.parent.mkdir(parents=True, exist_ok=True)
             if not dst.is_file():
                 urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(dst))
-        model_dir = Path(os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model"))
-        if not (model_dir / "armiger_onnx.py").is_file():
-            model_dir.mkdir(parents=True, exist_ok=True)
-            snapshot_download(repo_id=os.environ.get("ARMIGER_HF_REPO", "NorviTech/armiger-ultra"), local_dir=str(model_dir))
         '
         exec python3 /var/lib/armiger/rats-search/rats_search_connector.py
     healthcheck:

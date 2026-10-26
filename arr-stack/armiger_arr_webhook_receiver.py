@@ -1,22 +1,7 @@
-"""Armiger Post-Import Webhook & ffprobe Ground-Truth Receiver for Sonarr, Radarr, Lidarr, Readarr & qBittorrent.
-
-Wires completion and import events from the *Arr media automation stack and qBittorrent directly into
-Armiger's `SeriesWebhookAdapter`, `MovieWebhookAdapter`, `AudioWebhookAdapter`, `PublicationWebhookAdapter`,
-`QBittorrentAdapter`, and `PhysicalGroundTruthVerifier`:
-  - `POST /webhooks/sonarr`       -> `SeriesWebhookAdapter` (`adapter="series_webhook"`)
-  - `POST /webhooks/radarr`       -> `MovieWebhookAdapter` (`adapter="movie_webhook"`)
-  - `POST /webhooks/lidarr`       -> `AudioWebhookAdapter` (`adapter="audio_webhook"`)
-  - `POST /webhooks/readarr`      -> `PublicationWebhookAdapter` (`adapter="publication_webhook"`)
-  - `POST /webhooks/qbittorrent`  -> `QBittorrentAdapter` (`adapter="qbittorrent"`)
-
-When `ARMIGER_RUN_FFPROBE=true` and the imported media path is accessible on disk, the receiver runs
-`ffprobe -v quiet -print_format json -show_format -show_streams <path>` to physically verify video/audio
-codecs, channel counts, audio languages, and subtitle tracks before passing the observation to
-`ArmigerUltraPipeline.ingest_rsi_feedback(...)`.
-"""
+"""Post-import *Arr and qBittorrent feedback, with optional ffprobe verification."""
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -28,17 +13,7 @@ _CONNECTOR_ROOT = Path(__file__).resolve().parents[1]
 if str(_CONNECTOR_ROOT / "bitmagnet") not in sys.path:
     sys.path.insert(0, str(_CONNECTOR_ROOT / "bitmagnet"))
 
-from bitmagnet_connector import ensure_armiger_model_dir  # noqa: E402
-
-ROOT_DIR = ensure_armiger_model_dir(
-    os.environ.get("ARMIGER_MODEL_DIR", str(_CONNECTOR_ROOT.parent / "armiger")),
-    auto_download=os.environ.get("ARMIGER_AUTO_DOWNLOAD", "false").lower() == "true",
-)
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from armiger_dht_rsi import DHTRSIMode, resolve_opt_in_sharing  # noqa: E402
-from armiger_ultra_pipeline import ArmigerUltraPipeline  # noqa: E402
+from bitmagnet_connector import JSONHandler, load_armiger_classifier  # noqa: E402
 
 ROUTE_TO_ADAPTER: Dict[str, str] = {
     "/webhooks/sonarr": "series_webhook",
@@ -81,18 +56,21 @@ class ArmigerArrWebhookService:
 
     def __init__(
         self,
-        pipeline: Optional[ArmigerUltraPipeline] = None,
+        pipeline: Optional[Any] = None,
         *,
         enable_ffprobe: bool = False,
         ffprobe_runner: Callable[[str], Optional[Dict[str, Any]]] = run_ffprobe_json,
         opt_in_sharing: Optional[bool] = None,
     ) -> None:
-        self.opt_in_sharing: bool = resolve_opt_in_sharing(opt_in_sharing)
-        self.pipeline = pipeline or ArmigerUltraPipeline.from_directory(
-            ROOT_DIR, variant="int8", preload_catalog=False, opt_in_sharing=self.opt_in_sharing
+        self.pipeline = pipeline if pipeline is not None else load_armiger_classifier(
+            os.environ.get("ARMIGER_MODEL_DIR", str(_CONNECTOR_ROOT.parent / "armiger")),
+            variant="int8", preload_catalog=False, opt_in_sharing=opt_in_sharing,
+            auto_download=os.environ.get("ARMIGER_AUTO_DOWNLOAD", "false").lower() == "true",
         )
-        if opt_in_sharing is None and pipeline is not None:
-            self.opt_in_sharing = bool(getattr(pipeline, "opt_in_sharing", False))
+        self.opt_in_sharing = (
+            bool(getattr(self.pipeline, "opt_in_sharing", False))
+            if opt_in_sharing is None else opt_in_sharing
+        )
         self.enable_ffprobe = enable_ffprobe
         self.ffprobe_runner = ffprobe_runner
 
@@ -165,29 +143,18 @@ class ArmigerArrWebhookService:
 
 
 def create_webhook_server(host: str = "localhost", port: int = 8098) -> ThreadingHTTPServer:
-    model_dir = str(ensure_armiger_model_dir(os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model"), auto_download=os.environ.get("ARMIGER_AUTO_DOWNLOAD", "true").lower() == "true"))
-    variant = os.environ.get("ARMIGER_VARIANT", "int8")
     rsi_mode_str = os.environ.get("ARMIGER_DHT_RSI_MODE", "pull_only")
-    pipeline = ArmigerUltraPipeline.from_directory(
-        model_dir,
-        variant=variant,
-        rsi_mode=DHTRSIMode(rsi_mode_str),
-        preload_catalog=False,
+    pipeline = load_armiger_classifier(
+        os.environ.get("ARMIGER_MODEL_DIR", "/var/lib/armiger/model"),
+        variant=os.environ.get("ARMIGER_VARIANT", "int8"), preload_catalog=False,
+        auto_download=os.environ.get("ARMIGER_AUTO_DOWNLOAD", "true").lower() == "true",
     )
     service = ArmigerArrWebhookService(
         pipeline,
         enable_ffprobe=os.environ.get("ARMIGER_RUN_FFPROBE", "true").lower() == "true",
     )
 
-    class WebhookHandler(BaseHTTPRequestHandler):
-        def _send_json(self, status: int, data: Dict[str, Any]) -> None:
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
+    class WebhookHandler(JSONHandler):
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 self._send_json(200, {"status": "ok", "service": "armiger-arr-webhook-receiver", "rsi_mode": rsi_mode_str})
@@ -203,9 +170,6 @@ def create_webhook_server(host: str = "localhost", port: int = 8098) -> Threadin
                 self._send_json(200, res)
             else:
                 self._send_json(404, {"error": "not_found"})
-
-        def log_message(self, fmt: str, *args: Any) -> None:
-            return
 
     return ThreadingHTTPServer((host, port), WebhookHandler)
 
