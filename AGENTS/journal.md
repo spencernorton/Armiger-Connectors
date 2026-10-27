@@ -1,3 +1,12 @@
+## 2026-10-26 — Document Bitmagnet setup, usage, and all environment variables
+
+- **Branch:** docs/bitmagnet-env-and-usage-guide
+- **What changed:** Expand `bitmagnet/README.md` with step-by-step setup (turnkey Compose and existing Bitmagnet instance), usage instructions for `armiger-*` tags in Bitmagnet (`:3333`), Prowlarr/`*Arr` Torznab proxy filtering (`:8097/torznab`), and HTTP health/classification endpoints (`:8096`), plus complete environment variable tables covering stack/Bitmagnet settings, polling and `DHT_CRAWLER_SCALING_FACTOR` scaling, Torznab filtering, index pruning, model/catalog/listener settings, and BEP 44/46 auto-update / opt-in sharing variables. Expose `DHT_CRAWLER_SCALING_FACTOR`, `ARMIGER_ENABLE_TORZNAB_PROXY`, `ARMIGER_DHT_AUTO_UPDATE`, `ARMIGER_DHT_POLL_INTERVAL_SEC`, and `ARMIGER_DHT_SHARE_OPT_IN` in `bitmagnet/docker-compose.yml`.
+- **Validation:** Ran `pytest -q` and `docker compose -f bitmagnet/docker-compose.yml config --quiet`.
+- **Deployment:** None; documentation and Compose interpolation defaults only (`bitmagnet_connector.py` bytes unchanged).
+- **Next step:** Merge after green required checks.
+- **Status file updated:** Yes.
+
 ## 2026-10-26 — NorviTechGH — Paginate Bitmagnet poller across multi-batch crawl flushes
 
 - **Branch:** fix/bitmagnet-poller-pagination
