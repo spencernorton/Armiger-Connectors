@@ -2,7 +2,7 @@
 
 The connector polls stock [Bitmagnet](https://github.com/bitmagnet-io/bitmagnet), batch-fetches file lists (`torrent.files`), evaluates all 9 Armiger neural heads and Ultra plugins, and groups results into GraphQL tag (`torrent.putTags`) and deletion (`torrent.delete`) mutations. It also exposes a pre-grab filtered Torznab proxy (`:8097/torznab`) and an HTTP classification bridge (`:8096`).
 
-> **Looking for the prebuilt all-in-one container image?** See the [Armiger Bitmagnet setup guide](https://github.com/spencernorton/armiger/blob/main/examples/bitmagnet/README.md) and [configuration reference](https://github.com/spencernorton/armiger/blob/main/docs/bitmagnet-configuration.md), which use `ghcr.io/spencernorton/armiger:3.3.2` with the Ultra model pre-bundled in `/models`.
+> **Looking for the prebuilt all-in-one container image?** See the [Armiger Bitmagnet setup guide](https://github.com/spencernorton/armiger/blob/main/examples/bitmagnet/README.md) and [configuration reference](https://github.com/spencernorton/armiger/blob/main/docs/bitmagnet-configuration.md), which use `ghcr.io/spencernorton/armiger:3.3.3` with the Ultra model pre-bundled in `/models`.
 
 ---
 
