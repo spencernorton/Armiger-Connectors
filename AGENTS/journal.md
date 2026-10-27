@@ -1,3 +1,10 @@
+## 2026-10-27 — Release v1.2.4: Sync Bitmagnet guide image tag to armiger:3.3.3 and publish GitHub Release
+
+- **Branch:** release/v1.2.4-sync-armiger-333
+- **What changed:** Bump `pyproject.toml` version to `1.2.4` and update `bitmagnet/README.md` image reference to `ghcr.io/spencernorton/armiger:3.3.3`.
+- **Validation:** `pytest -q` and `git diff --check`.
+- **Follow-ups:** Publish `v1.2.4` GitHub Release.
+
 ## 2026-10-26 — Document Bitmagnet setup, usage, and all environment variables
 
 - **Branch:** docs/bitmagnet-env-and-usage-guide
