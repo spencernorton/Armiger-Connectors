@@ -9,6 +9,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from bitmagnet_connector import (
+    BITMAGNET_VIABILITY_TAG_MAP,
+    LEGACY_VIABILITY_TAG_REPAIR_MAP,
     BitmagnetConnector,
     create_server as create_bitmagnet_server,
     has_disguised_executable,
@@ -122,6 +124,184 @@ def test_bitmagnet_accepts_long_viability_labels_without_merging_distinct_tags()
         assert sanitize_bitmagnet_tag(tag) == tag
     mutation = BitmagnetConnector.build_put_tags_mutation(["ab" * 20], labels)
     assert mutation["variables"]["tagNames"] == tags
+
+
+def test_canonical_viability_tag_mapping_and_legacy_aliases() -> None:
+    expected = {
+        "alive_viable": "armiger-viability-alive-viable",
+        "degraded_viable": "armiger-viability-degraded",
+        "suspect_stalled": "armiger-viability-stalled",
+        "dead_known_zero": "armiger-viability-dead",
+        "dead": "armiger-viability-dead",
+        "unknown_cold": "armiger-viability-unknown-cold",
+    }
+    assert BITMAGNET_VIABILITY_TAG_MAP == expected
+    for tier, canonical_tag in expected.items():
+        assert len(canonical_tag) <= 30
+        assert sanitize_bitmagnet_tag(f"armiger-viability-{tier}") == canonical_tag
+        assert sanitize_bitmagnet_tag(canonical_tag) == canonical_tag
+
+    # Legacy hash-truncated tags normalize to canonical Option 2 tags on putTags
+    assert sanitize_bitmagnet_tag("armiger-viability-dea-c24281f7") == "armiger-viability-dead"
+    assert sanitize_bitmagnet_tag("armiger-viability-deg-7c170f8b") == "armiger-viability-degraded"
+    assert sanitize_bitmagnet_tag("armiger-viability-sus-cdc9d2c6") == "armiger-viability-stalled"
+
+    # build_delete_tags_mutation must preserve exact legacy tag names so Bitmagnet deletes them
+    del_mut = BitmagnetConnector.build_delete_tags_mutation(
+        ["ab" * 20],
+        list(LEGACY_VIABILITY_TAG_REPAIR_MAP.keys()),
+    )
+    assert del_mut is not None
+    assert "deleteTags(infoHashes: $infoHashes, tagNames: $tagNames)" in del_mut["query"]
+    assert del_mut["variables"]["tagNames"] == [
+        "armiger-viability-dea-c24281f7",
+        "armiger-viability-deg-7c170f8b",
+        "armiger-viability-sus-cdc9d2c6",
+    ]
+
+
+def test_bitmagnet_repair_legacy_viability_tags_and_opportunistic_sync_repair() -> None:
+    rows: List[Dict[str, Any]] = [
+        {
+            "infoHash": f"{1:040x}",
+            "title": "Dead Swarm A",
+            "torrent": {
+                "infoHash": f"{1:040x}",
+                "name": "Dead.Swarm.A.1080p",
+                "size": 1_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 0,
+                "leechers": 1,
+                "tagNames": ["armiger-movie", "armiger-lang-english", "armiger-viability-dea-c24281f7"],
+            },
+        },
+        {
+            "infoHash": f"{2:040x}",
+            "title": "Dead Swarm B",
+            "torrent": {
+                "infoHash": f"{2:040x}",
+                "name": "Dead.Swarm.B.1080p",
+                "size": 1_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 0,
+                "leechers": 2,
+                "tagNames": ["armiger-movie", "armiger-lang-english", "armiger-viability-dea-c24281f7"],
+            },
+        },
+        {
+            "infoHash": f"{3:040x}",
+            "title": "Degraded Swarm C",
+            "torrent": {
+                "infoHash": f"{3:040x}",
+                "name": "Degraded.Swarm.C.1080p",
+                "size": 1_500_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 1,
+                "leechers": 5,
+                "tagNames": ["armiger-tv-show", "armiger-lang-english", "armiger-viability-deg-7c170f8b"],
+            },
+        },
+        {
+            "infoHash": f"{4:040x}",
+            "title": "Stalled Swarm D",
+            "torrent": {
+                "infoHash": f"{4:040x}",
+                "name": "Stalled.Swarm.D.1080p",
+                "size": 2_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 0,
+                "leechers": 8,
+                "tagNames": ["armiger-software", "armiger-lang-english", "armiger-viability-sus-cdc9d2c6"],
+            },
+        },
+    ]
+    mutation_order: List[str] = []
+
+    def fake_transport(url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        q = str(payload.get("query") or "")
+        variables = payload.get("variables") or {}
+        if "ArmigerRecentTorrents" in q:
+            inp = variables.get("input") or {}
+            lim = int(inp.get("limit") or 100)
+            off = int(inp.get("offset") or 0)
+            facet_filter = (
+                ((inp.get("facets") or {}).get("torrentTag") or {}).get("filter") or []
+            )
+            if facet_filter:
+                matched = [
+                    r for r in rows
+                    if any(t in (r["torrent"].get("tagNames") or []) for t in facet_filter)
+                ]
+            else:
+                matched = list(rows)
+            page = matched[off : off + lim]
+            return {
+                "data": {
+                    "torrentContent": {
+                        "search": {
+                            "hasNextPage": (off + lim) < len(matched),
+                            "items": page,
+                        }
+                    }
+                }
+            }
+        if "TorrentPutTags" in q:
+            mutation_order.append("putTags")
+            tag_hashes = set(variables.get("infoHashes") or [])
+            new_tags = list(variables.get("tagNames") or [])
+            for r in rows:
+                if r["infoHash"] in tag_hashes:
+                    existing = list(r["torrent"].get("tagNames") or [])
+                    r["torrent"]["tagNames"] = list(dict.fromkeys(existing + new_tags))
+            return {"data": {"torrent": {"putTags": None}}}
+        if "TorrentDeleteTags" in q:
+            mutation_order.append("deleteTags")
+            tag_hashes = set(variables.get("infoHashes") or [])
+            del_tags = set(variables.get("tagNames") or [])
+            for r in rows:
+                if r["infoHash"] in tag_hashes:
+                    existing = list(r["torrent"].get("tagNames") or [])
+                    r["torrent"]["tagNames"] = [t for t in existing if t not in del_tags]
+            return {"data": {"torrent": {"deleteTags": None}}}
+        return {"data": {}}
+
+    connector = BitmagnetConnector(SyntheticArmigerClassifier(), graphql_transport=fake_transport)
+    report = connector.repair_legacy_viability_tags(limit=1, max_pages=10, apply_mutations=True)
+    assert report["repairedCount"] == 4
+    assert report["complete"] is True
+    assert report["byTag"] == {
+        "armiger-viability-dea-c24281f7": 2,
+        "armiger-viability-deg-7c170f8b": 1,
+        "armiger-viability-sus-cdc9d2c6": 1,
+    }
+    assert "armiger-viability-dead" in rows[0]["torrent"]["tagNames"]
+    assert "armiger-viability-dea-c24281f7" not in rows[0]["torrent"]["tagNames"]
+    assert "armiger-movie" in rows[0]["torrent"]["tagNames"]
+    assert "armiger-viability-dead" in rows[1]["torrent"]["tagNames"]
+    assert "armiger-viability-dea-c24281f7" not in rows[1]["torrent"]["tagNames"]
+    assert "armiger-viability-degraded" in rows[2]["torrent"]["tagNames"]
+    assert "armiger-viability-deg-7c170f8b" not in rows[2]["torrent"]["tagNames"]
+    assert "armiger-viability-stalled" in rows[3]["torrent"]["tagNames"]
+    assert "armiger-viability-sus-cdc9d2c6" not in rows[3]["torrent"]["tagNames"]
+    assert mutation_order[0] == "putTags"
+
+    # Second pass is a no-op once legacy tags are removed
+    second = connector.repair_legacy_viability_tags(limit=10, max_pages=10, apply_mutations=True)
+    assert second["repairedCount"] == 0
+    assert second["graphqlPutTagsMutations"] == []
+    assert second["graphqlDeleteTagsMutations"] == []
+
+    # Opportunistic sync_once repair if a scanned page contains a legacy tag
+    rows[0]["torrent"]["tagNames"].append("armiger-viability-dea-c24281f7")
+    rows[0]["torrent"]["tagNames"].remove("armiger-viability-dead")
+    sync_res = connector.sync_once(limit=10, apply_mutations=True)
+    assert sync_res.get("repairedLegacyCount") == 1
+    assert "armiger-viability-dead" in rows[0]["torrent"]["tagNames"]
+    assert "armiger-viability-dea-c24281f7" not in rows[0]["torrent"]["tagNames"]
 
 
 def test_bitmagnet_evaluate_batch_groups_tags_and_prunes_malware() -> None:

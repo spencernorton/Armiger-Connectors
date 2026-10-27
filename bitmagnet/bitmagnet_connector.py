@@ -99,10 +99,41 @@ mutation TorrentPutTags($infoHashes: [Hash20!]!, $tagNames: [String!]!) {
 }
 """.strip()
 
+GRAPHQL_DELETE_TAGS_MUTATION = """
+mutation TorrentDeleteTags($infoHashes: [Hash20!], $tagNames: [String!]) {
+  torrent {
+    deleteTags(infoHashes: $infoHashes, tagNames: $tagNames)
+  }
+}
+""".strip()
+
+BITMAGNET_VIABILITY_TAG_MAP: Dict[str, str] = {
+    "alive_viable": "armiger-viability-alive-viable",
+    "degraded_viable": "armiger-viability-degraded",
+    "suspect_stalled": "armiger-viability-stalled",
+    "dead_known_zero": "armiger-viability-dead",
+    "dead": "armiger-viability-dead",
+    "unknown_cold": "armiger-viability-unknown-cold",
+}
+
+LEGACY_VIABILITY_TAG_REPAIR_MAP: Dict[str, str] = {
+    "armiger-viability-dea-c24281f7": "armiger-viability-dead",
+    "armiger-viability-deg-7c170f8b": "armiger-viability-degraded",
+    "armiger-viability-sus-cdc9d2c6": "armiger-viability-stalled",
+}
+
+BITMAGNET_TAG_ALIAS_MAP: Dict[str, str] = {
+    "armiger-viability-degraded-viable": "armiger-viability-degraded",
+    "armiger-viability-suspect-stalled": "armiger-viability-stalled",
+    "armiger-viability-dead-known-zero": "armiger-viability-dead",
+    **LEGACY_VIABILITY_TAG_REPAIR_MAP,
+}
+
 
 def sanitize_bitmagnet_tag(tag: str) -> str:
     """Normalize to stock Bitmagnet's kebab-case and 30-character limit."""
     normalized = _NON_KEBAB_RE.sub("-", str(tag or "").strip().lower()).strip("-")
+    normalized = BITMAGNET_TAG_ALIAS_MAP.get(normalized, normalized)
     if len(normalized) > 30:
         suffix = hashlib.sha256(normalized.encode()).hexdigest()[:8]
         normalized = normalized[:21].rstrip("-") + "-" + suffix
@@ -555,6 +586,27 @@ class BitmagnetConnector(ClassifierConnector):
             },
         }
 
+    @staticmethod
+    def build_delete_tags_mutation(
+        infohashes: Sequence[str], tag_names: Sequence[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Build stock Bitmagnet `torrent.deleteTags(infoHashes: $infoHashes, tagNames: $tagNames)` payload."""
+        clean_hashes = [h.strip().lower() for h in infohashes if h and h.strip()]
+        clean_tags = [
+            normalized
+            for t in tag_names
+            if t and (normalized := _NON_KEBAB_RE.sub("-", str(t).strip().lower()).strip("-"))
+        ]
+        if not clean_hashes or not clean_tags:
+            return None
+        return {
+            "query": GRAPHQL_DELETE_TAGS_MUTATION,
+            "variables": {
+                "infoHashes": list(dict.fromkeys(clean_hashes)),
+                "tagNames": list(dict.fromkeys(clean_tags)),
+            },
+        }
+
     def evaluate_batch(
         self,
         items: Sequence[Mapping[str, Any]],
@@ -621,8 +673,14 @@ class BitmagnetConnector(ClassifierConnector):
                 raw_tags.append("armiger-title-non-english")
             elif pred.get("title_language") == "english_title":
                 raw_tags.append("armiger-title-english")
-            if pred["viability_tier"] != "unknown":
-                raw_tags.append(f"armiger-viability-{pred['viability_tier']}")
+            viability_tier = str(pred.get("viability_tier") or "unknown").strip().lower()
+            if viability_tier and viability_tier != "unknown":
+                raw_tags.append(
+                    BITMAGNET_VIABILITY_TAG_MAP.get(
+                        viability_tier,
+                        f"armiger-viability-{viability_tier}",
+                    )
+                )
             if pred["anime"] == "anime":
                 raw_tags.append("armiger-anime")
                 if pred.get("anime_dub_status"):
@@ -682,6 +740,8 @@ class BitmagnetConnector(ClassifierConnector):
         offset = 0
         pages_scanned = 0
         wave_complete = False
+        legacy_put_by_tag: OrderedDict[str, List[str]] = OrderedDict()
+        legacy_delete_by_tag: OrderedDict[str, List[str]] = OrderedDict()
 
         while len(untagged_items) < page_limit and pages_scanned < max_scan_pages:
             search_input: Dict[str, Any] = {
@@ -718,6 +778,16 @@ class BitmagnetConnector(ClassifierConnector):
                 if not ih or ih in queued_hashes:
                     continue
                 existing_tags = t_obj.get("tagNames") or []
+                existing_norm = {str(t).strip().lower() for t in existing_tags if t}
+                for legacy_tag, replacement_tag in LEGACY_VIABILITY_TAG_REPAIR_MAP.items():
+                    if legacy_tag in existing_norm:
+                        del_list = legacy_delete_by_tag.setdefault(legacy_tag, [])
+                        if ih not in del_list:
+                            del_list.append(ih)
+                        if replacement_tag not in existing_norm:
+                            put_list = legacy_put_by_tag.setdefault(replacement_tag, [])
+                            if ih not in put_list:
+                                put_list.append(ih)
                 has_armiger_tag = any(str(t).startswith(("armiger-", "armiger:")) for t in existing_tags)
                 if ih in self._seen or has_armiger_tag:
                     if has_armiger_tag:
@@ -785,11 +855,30 @@ class BitmagnetConnector(ClassifierConnector):
                     })
 
         result = self.evaluate_batch(untagged_items, files_by_hash=files_by_hash)
+        repair_put_mutations = [
+            mut
+            for replacement_tag, hashes in legacy_put_by_tag.items()
+            if (mut := self.build_put_tags_mutation(hashes, [replacement_tag])) is not None
+        ]
+        repair_delete_mutations = [
+            mut
+            for legacy_tag, hashes in legacy_delete_by_tag.items()
+            if (mut := self.build_delete_tags_mutation(hashes, [legacy_tag])) is not None
+        ]
+        if repair_delete_mutations:
+            result["repairedLegacyCount"] = sum(len(h) for h in legacy_delete_by_tag.values())
+            result["graphqlRepairPutTagsMutations"] = repair_put_mutations
+            result["graphqlRepairDeleteTagsMutations"] = repair_delete_mutations
+
         if apply_mutations:
             if result["graphqlDeleteMutation"] is not None:
                 self._transport(self.graphql_url, result["graphqlDeleteMutation"])
             for tag_mut in result["graphqlPutTagsMutations"]:
                 self._transport(self.graphql_url, tag_mut)
+            for repair_put in repair_put_mutations:
+                self._transport(self.graphql_url, repair_put)
+            for repair_del in repair_delete_mutations:
+                self._transport(self.graphql_url, repair_del)
 
         if wave_complete or not untagged_items:
             self._wave_seen.clear()
@@ -804,6 +893,100 @@ class BitmagnetConnector(ClassifierConnector):
                 else:
                     self._wave_seen.add(act_ih)
         return result
+
+    def repair_legacy_viability_tags(
+        self,
+        limit: int = 500,
+        max_pages: int = 20,
+        apply_mutations: bool = True,
+    ) -> Dict[str, Any]:
+        """Find torrents carrying legacy hash-truncated viability tags and replace them with canonical tags."""
+        page_limit = max(1, int(limit))
+        max_scan_pages = max(1, int(max_pages))
+        by_tag: Dict[str, int] = {}
+        put_mutations: List[Dict[str, Any]] = []
+        delete_mutations: List[Dict[str, Any]] = []
+        all_complete = True
+
+        for legacy_tag, replacement_tag in LEGACY_VIABILITY_TAG_REPAIR_MAP.items():
+            offset = 0
+            pages = 0
+            put_hashes: List[str] = []
+            delete_hashes: List[str] = []
+            seen_for_tag: set[str] = set()
+            has_next = False
+
+            while pages < max_scan_pages:
+                search_input: Dict[str, Any] = {
+                    "limit": page_limit,
+                    "hasNextPage": True,
+                    "facets": {"torrentTag": {"filter": [legacy_tag]}},
+                }
+                if offset > 0:
+                    search_input["offset"] = offset
+                resp = self._transport(
+                    self.graphql_url,
+                    {"query": GRAPHQL_RECENT_TORRENTS_QUERY, "variables": {"input": search_input}},
+                )
+                search_data = (
+                    resp.get("data", {})
+                    .get("torrentContent", {})
+                    .get("search", {})
+                ) or {}
+                raw_items = search_data.get("items") or []
+                pages += 1
+
+                if not raw_items:
+                    has_next = False
+                    break
+
+                new_in_page = 0
+                for item in raw_items:
+                    t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
+                    ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
+                    if not ih or ih in seen_for_tag:
+                        continue
+                    existing_tags = t_obj.get("tagNames") or []
+                    existing_norm = {str(t).strip().lower() for t in existing_tags if t}
+                    if existing_norm and legacy_tag not in existing_norm:
+                        continue
+                    seen_for_tag.add(ih)
+                    new_in_page += 1
+                    delete_hashes.append(ih)
+                    if replacement_tag not in existing_norm:
+                        put_hashes.append(ih)
+
+                raw_has_next = search_data.get("hasNextPage")
+                has_next = (len(raw_items) >= page_limit) if raw_has_next is None else bool(raw_has_next)
+                if not has_next or new_in_page == 0:
+                    has_next = False
+                    break
+                offset += len(raw_items)
+
+            if has_next:
+                all_complete = False
+
+            by_tag[legacy_tag] = len(delete_hashes)
+            for idx in range(0, len(put_hashes), page_limit):
+                chunk = put_hashes[idx : idx + page_limit]
+                if (put_mut := self.build_put_tags_mutation(chunk, [replacement_tag])) is not None:
+                    put_mutations.append(put_mut)
+                    if apply_mutations:
+                        self._transport(self.graphql_url, put_mut)
+            for idx in range(0, len(delete_hashes), page_limit):
+                chunk = delete_hashes[idx : idx + page_limit]
+                if (del_mut := self.build_delete_tags_mutation(chunk, [legacy_tag])) is not None:
+                    delete_mutations.append(del_mut)
+                    if apply_mutations:
+                        self._transport(self.graphql_url, del_mut)
+
+        return {
+            "repairedCount": sum(by_tag.values()),
+            "byTag": by_tag,
+            "complete": all_complete,
+            "graphqlPutTagsMutations": put_mutations,
+            "graphqlDeleteTagsMutations": delete_mutations,
+        }
 
     _extract_torznab_item_row = staticmethod(extract_torznab_item_row)
 
@@ -893,6 +1076,16 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
                     for tag_mut in result["graphqlPutTagsMutations"]:
                         connector._transport(connector.graphql_url, tag_mut)
                 self._send_json(200, result)
+            elif self.path == "/v1/bitmagnet/repair-tags":
+                limit = int(payload.get("limit") or 500)
+                max_pages = int(payload.get("maxPages") or 20)
+                apply_mutations = bool(payload.get("applyMutations", True) and connector.graphql_url)
+                result = connector.repair_legacy_viability_tags(
+                    limit=limit,
+                    max_pages=max_pages,
+                    apply_mutations=apply_mutations,
+                )
+                self._send_json(200, result)
             else:
                 self._send_json(404, {"error": "not_found"})
 
@@ -950,8 +1143,22 @@ def main() -> None:
         f"(variant={variant}, interval={poll_interval}s, batch={batch_size})",
         flush=True,
     )
+    legacy_repair_done = False
     while True:
         try:
+            if not legacy_repair_done:
+                repair_res = connector.repair_legacy_viability_tags(
+                    limit=max(100, batch_size),
+                    apply_mutations=True,
+                )
+                if repair_res["repairedCount"] > 0:
+                    print(
+                        f"[bitmagnet-connector] repaired {repair_res['repairedCount']} "
+                        f"legacy viability tag assignments ({repair_res['byTag']})",
+                        flush=True,
+                    )
+                if repair_res.get("complete", True):
+                    legacy_repair_done = True
             connector.sync_once(limit=batch_size, apply_mutations=True)
         except Exception as exc:
             print(f"[bitmagnet-connector] poll error: {exc}", file=sys.stderr, flush=True)
