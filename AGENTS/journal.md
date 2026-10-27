@@ -1,3 +1,13 @@
+## 2026-10-27 — NorviTechGH — Canonical Bitmagnet viability tags and automatic legacy tag repair (v1.2.5)
+
+- **Branch:** fix/bitmagnet-viability-tags-and-repair
+- **What changed:** Map Bitmagnet viability tier tags to human-readable canonical names within Bitmagnet's 30-character limit (`armiger-viability-alive-viable`, `armiger-viability-degraded`, `armiger-viability-stalled`, `armiger-viability-dead`, `armiger-viability-unknown-cold`). Add `BitmagnetConnector.build_delete_tags_mutation`, `BitmagnetConnector.repair_legacy_viability_tags`, `POST /v1/bitmagnet/repair-tags`, and opportunistic in-page repair in `sync_once` so existing instances automatically replace and delete legacy hash-truncated tags (`armiger-viability-dea-c24281f7`, `armiger-viability-deg-7c170f8b`, `armiger-viability-sus-cdc9d2c6`). Refresh cached `/data/armiger/bitmagnet_connector.py` on container start in `bitmagnet/docker-compose.yml` and bump package version to `1.2.5`.
+- **Why:** Fix `spencernorton/armiger#42` where 33-character viability tier names were hash-truncated to `armiger-viability-dea-c24281f7`, `armiger-viability-deg-7c170f8b`, and `armiger-viability-sus-cdc9d2c6`, and automatically migrate existing Bitmagnet databases.
+- **Validation:** 45 tests pass (`pytest -v`), `docker compose -f bitmagnet/docker-compose.yml config --quiet`, and `git diff --check`.
+- **Deployment:** None; pinned in `spencernorton/armiger` (`v3.3.4`).
+- **Next step:** Tag `v1.2.5` after merge and pin in `spencernorton/armiger`.
+- **Status file updated:** Yes.
+
 ## 2026-10-27 — Release v1.2.4: Sync Bitmagnet guide image tag to armiger:3.3.3 and publish GitHub Release
 
 - **Branch:** release/v1.2.4-sync-armiger-333

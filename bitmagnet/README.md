@@ -2,7 +2,7 @@
 
 The connector polls stock [Bitmagnet](https://github.com/bitmagnet-io/bitmagnet), batch-fetches file lists (`torrent.files`), evaluates all 9 Armiger neural heads and Ultra plugins, and groups results into GraphQL tag (`torrent.putTags`) and deletion (`torrent.delete`) mutations. It also exposes a pre-grab filtered Torznab proxy (`:8097/torznab`) and an HTTP classification bridge (`:8096`).
 
-> **Looking for the prebuilt all-in-one container image?** See the [Armiger Bitmagnet setup guide](https://github.com/spencernorton/armiger/blob/main/examples/bitmagnet/README.md) and [configuration reference](https://github.com/spencernorton/armiger/blob/main/docs/bitmagnet-configuration.md), which use `ghcr.io/spencernorton/armiger:3.3.3` with the Ultra model pre-bundled in `/models`.
+> **Looking for the prebuilt all-in-one container image?** See the [Armiger Bitmagnet setup guide](https://github.com/spencernorton/armiger/blob/main/examples/bitmagnet/README.md) and [configuration reference](https://github.com/spencernorton/armiger/blob/main/docs/bitmagnet-configuration.md), which use `ghcr.io/spencernorton/armiger:3.3.4` with the Ultra model pre-bundled in `/models`.
 
 ---
 
@@ -37,13 +37,14 @@ python3 bitmagnet/bitmagnet_connector.py
    - **Category:** `armiger-movie`, `armiger-tv-show`, `armiger-music`, `armiger-game`, `armiger-software`, `armiger-ebook`, `armiger-audiobook`, `armiger-comic`, `armiger-course`, `armiger-xxx`, `armiger-unknown`
    - **Audio language:** `armiger-lang-english`, `armiger-lang-non-english`, `armiger-lang-multi-or-unknown`
    - **Title script:** `armiger-title-english`, `armiger-title-non-english`
-   - **Swarm viability:** `armiger-viability-alive-viable`, `armiger-viability-unknown-cold`, plus 30-char hash-suffixed tags for `degraded_viable`, `suspect_stalled`, and `dead_known_zero`
+   - **Swarm viability:** `armiger-viability-alive-viable`, `armiger-viability-degraded`, `armiger-viability-stalled`, `armiger-viability-dead`, `armiger-viability-unknown-cold` *(legacy hash-truncated tags `armiger-viability-dea-c24281f7`, `armiger-viability-deg-7c170f8b`, and `armiger-viability-sus-cdc9d2c6` are automatically migrated and removed on startup)*
    - **Anime & subtitles:** `armiger-anime`, `armiger-dub-dual-audio-or-dub`, `armiger-dub-subbed-only`, `armiger-dub-raw-or-vernacular`, `armiger-eng-subs`
 2. **Use the filtered Torznab proxy in Prowlarr, Sonarr, Radarr, Lidarr, or Readarr (`http://localhost:8097/torznab`):**
    Point your indexer client at `http://localhost:8097/torznab` (or `http://armiger-bitmagnet-connector:8097/torznab` on the same Docker network) instead of `:3333/torznab`. The proxy automatically blocks disguised executables (`.mkv.exe`, `.scr`, `.lnk`, `.vbs`, `.bat`, `.ps1`, etc.), safety blocks, honeypot traps, and `junk` items, applies optional audio-language and dead-swarm rules, and annotates admitted items with `armiger_category`, `armiger_lang`, `armiger_title_lang`, `armiger_viability`, and `armiger_survival_prob`.
 3. **Inspect health and classify on demand (`http://localhost:8096`):**
    - `GET http://localhost:8096/healthz` — returns service status, model variant, catalog/adapter readiness, `active_seq`, `active_bundle_merkle_root`, `model_source`, `last_dht_check_ts`, and `sharing_status`.
    - `POST http://localhost:8096/v1/bitmagnet/classify` — classify a batch (`{"torrents": [...], "applyMutations": false}`) and inspect the resulting predictions and GraphQL mutations.
+   - `POST http://localhost:8096/v1/bitmagnet/repair-tags` — scan Bitmagnet for legacy hash-truncated viability tags and replace them with canonical tags.
 
 ---
 

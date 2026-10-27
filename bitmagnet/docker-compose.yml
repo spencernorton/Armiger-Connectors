@@ -101,9 +101,7 @@ services:
           CONNECTOR_SCRIPT=/workspace/bitmagnet/bitmagnet_connector.py
         else
           CONNECTOR_SCRIPT=/data/armiger/bitmagnet_connector.py
-          if [ ! -f "$$CONNECTOR_SCRIPT" ]; then
-            /data/armiger/.venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/spencernorton/Armiger-Connectors/main/bitmagnet/bitmagnet_connector.py', '/data/armiger/bitmagnet_connector.py')"
-          fi
+          /data/armiger/.venv/bin/python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/spencernorton/Armiger-Connectors/main/bitmagnet/bitmagnet_connector.py', '/data/armiger/bitmagnet_connector.py.tmp')" && mv /data/armiger/bitmagnet_connector.py.tmp "$$CONNECTOR_SCRIPT" || rm -f /data/armiger/bitmagnet_connector.py.tmp
         fi
         exec /data/armiger/.venv/bin/python3 "$$CONNECTOR_SCRIPT"
     healthcheck:
