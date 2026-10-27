@@ -5,13 +5,13 @@ services:
     restart: unless-stopped
     shm_size: 256mb
     environment:
-      POSTGRES_DB: "${POSTGRES_DB:-bitmagnet}"
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-bitmagnet}"
+      POSTGRES_DB: "bitmagnet"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "bitmagnet"
     volumes:
       - bitmagnet_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB:-bitmagnet} -U $${POSTGRES_USER:-postgres}"]
+      test: ["CMD-SHELL", "pg_isready -d bitmagnet -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,16 +24,16 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "${BITMAGNET_HTTP_PORT:-3333}:3333"
-      - "${BITMAGNET_DHT_PORT:-3334}:3334/tcp"
-      - "${BITMAGNET_DHT_PORT:-3334}:3334/udp"
+      - "3333:3333"
+      - "3334:3334/tcp"
+      - "3334:3334/udp"
     environment:
       POSTGRES_HOST: postgres
-      POSTGRES_NAME: "${POSTGRES_DB:-bitmagnet}"
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-bitmagnet}"
-      TMDB_API_KEY: "${TMDB_API_KEY:-}"
-      DHT_CRAWLER_SCALING_FACTOR: "${DHT_CRAWLER_SCALING_FACTOR:-10}"
+      POSTGRES_NAME: "bitmagnet"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "bitmagnet"
+      TMDB_API_KEY: ""
+      DHT_CRAWLER_SCALING_FACTOR: "10"
     command:
       - worker
       - run
@@ -52,35 +52,34 @@ services:
         condition: service_started
     working_dir: /data/armiger
     ports:
-      - "${ARMIGER_BRIDGE_PORT:-8096}:8096"
-      - "${ARMIGER_PROXY_PORT:-8097}:8097"
+      - "8096:8096"
+      - "8097:8097"
     environment:
       ARMIGER_MODEL_DIR: "/data/armiger/model"
-      ARMIGER_HF_REPO: "${ARMIGER_HF_REPO:-NorviTech/armiger-ultra}"
-      ARMIGER_AUTO_DOWNLOAD: "${ARMIGER_AUTO_DOWNLOAD:-true}"
-      ARMIGER_VARIANT: "${ARMIGER_VARIANT:-ultra}"
-      ARMIGER_USE_ZERO_CUE_CATALOG: "${ARMIGER_USE_ZERO_CUE_CATALOG:-true}"
-      ARMIGER_DHT_RSI_MODE: "${ARMIGER_DHT_RSI_MODE:-pull_only}"
-      ARMIGER_CONNECTOR_MODE: "${ARMIGER_CONNECTOR_MODE:-both}"
+      ARMIGER_HF_REPO: "NorviTech/armiger-ultra"
+      ARMIGER_AUTO_DOWNLOAD: "true"
+      ARMIGER_VARIANT: "ultra"
+      ARMIGER_USE_ZERO_CUE_CATALOG: "true"
+      ARMIGER_DHT_RSI_MODE: "pull_only"
+      ARMIGER_CONNECTOR_MODE: "both"
       ARMIGER_CONNECTOR_HOST: "0.0.0.0"
       ARMIGER_CONNECTOR_PORT: "8096"
       ARMIGER_PROXY_PORT: "8097"
-      BITMAGNET_GRAPHQL_URL: "${BITMAGNET_GRAPHQL_URL:-http://bitmagnet:3333/graphql}"
-      UPSTREAM_TORZNAB_URL: "${UPSTREAM_TORZNAB_URL:-http://bitmagnet:3333/torznab}"
-      BITMAGNET_POLL_SECONDS: "${BITMAGNET_POLL_SECONDS:-5}"
-      BITMAGNET_BATCH_SIZE: "${BITMAGNET_BATCH_SIZE:-100}"
-      ARMIGER_PRUNE_MALWARE: "${ARMIGER_PRUNE_MALWARE:-true}"
-      ARMIGER_PRUNE_DEAD_SWARMS: "${ARMIGER_PRUNE_DEAD_SWARMS:-false}"
-      ARMIGER_REQUIRE_ENGLISH_AUDIO: "${ARMIGER_REQUIRE_ENGLISH_AUDIO:-false}"
-      ARMIGER_ALLOW_ENGLISH_SUBS: "${ARMIGER_ALLOW_ENGLISH_SUBS:-true}"
-      ARMIGER_REJECT_DEAD_SWARMS: "${ARMIGER_REJECT_DEAD_SWARMS:-true}"
-      ARMIGER_ENABLE_TORZNAB_PROXY: "${ARMIGER_ENABLE_TORZNAB_PROXY:-true}"
-      ARMIGER_DHT_AUTO_UPDATE: "${ARMIGER_DHT_AUTO_UPDATE:-true}"
-      ARMIGER_DHT_POLL_INTERVAL_SEC: "${ARMIGER_DHT_POLL_INTERVAL_SEC:-14400}"
-      ARMIGER_DHT_SHARE_OPT_IN: "${ARMIGER_DHT_SHARE_OPT_IN:-false}"
+      BITMAGNET_GRAPHQL_URL: "http://bitmagnet:3333/graphql"
+      UPSTREAM_TORZNAB_URL: "http://bitmagnet:3333/torznab"
+      BITMAGNET_POLL_SECONDS: "5"
+      BITMAGNET_BATCH_SIZE: "100"
+      ARMIGER_PRUNE_MALWARE: "true"
+      ARMIGER_PRUNE_DEAD_SWARMS: "false"
+      ARMIGER_REQUIRE_ENGLISH_AUDIO: "false"
+      ARMIGER_ALLOW_ENGLISH_SUBS: "true"
+      ARMIGER_REJECT_DEAD_SWARMS: "true"
+      ARMIGER_ENABLE_TORZNAB_PROXY: "true"
+      ARMIGER_DHT_AUTO_UPDATE: "true"
+      ARMIGER_DHT_POLL_INTERVAL_SEC: "14400"
+      ARMIGER_DHT_SHARE_OPT_IN: "false"
     volumes:
       - .:/workspace:ro
-      - ${ARMIGER_HOST_MODEL_DIR:-.}:/host_model:ro
       - armiger_data:/data/armiger
     command:
       - /bin/sh
@@ -93,9 +92,7 @@ services:
           /data/armiger/.venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
           touch /data/armiger/.venv/.armiger_ultra_v3_ready
         fi
-        if [ -f /host_model/armiger_ultra_pipeline.py ]; then
-          export ARMIGER_MODEL_DIR=/host_model
-        elif [ -f /workspace/armiger_ultra_pipeline.py ]; then
+        if [ -f /workspace/armiger_ultra_pipeline.py ]; then
           export ARMIGER_MODEL_DIR=/workspace
         fi
         if [ -f /workspace/bitmagnet_connector.py ]; then
