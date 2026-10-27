@@ -7,6 +7,12 @@
 - **Next step:** Merge after green required checks.
 - **Status file updated:** Yes.
 
+## 2026-10-26 — Clarify Bitmagnet env variable options, pre-populated defaults, and literal Compose values
+
+### Summary
+- Replaced `${VAR:-default}` variable interpolation in `bitmagnet/docker-compose.yml` with literal default values so the file can be copy-pasted and started directly with `docker compose up -d`.
+- Added `Required / Optional` and `Valid options / range` columns to all environment variable tables in `bitmagnet/README.md`, and simplified the automatic model updates section with pre-populated defaults.
+
 ## 2026-10-26 — NorviTechGH — Paginate Bitmagnet poller across multi-batch crawl flushes
 
 - **Branch:** fix/bitmagnet-poller-pagination
