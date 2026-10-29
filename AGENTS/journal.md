@@ -1,3 +1,9 @@
+## 2026-10-28 — Use the complete 3.4.3 acceptance release
+
+- **Branch:** codex/runtime-acceptance
+- **What changed:** Pin the prepared exact-source container gate to Armiger v3.4.3 and its Rats backend. The attempted 3.4.2 publication stopped at a Docker-list annotation check after functional acceptance, leaving an incomplete immutable registry tag. The corrected producer validates provenance in every tested native image config.
+- **Validation:** Wrapper actionlint and unit checks remain required. Native candidate checks start after the complete v3.4.3 producer release exists; the model and connector runtime source are unchanged.
+
 ## 2026-10-28 — Require real native container and upstream acceptance
 
 - **Branch:** codex/runtime-acceptance
