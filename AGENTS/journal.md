@@ -1,3 +1,13 @@
+## 2026-10-29 — NorviTechGH — Sync Bitmagnet contentType hints and promote Unknown/8000 Torznab categories (v1.2.6)
+
+- **Branch:** fix/bitmagnet-torznab-categories
+- **What changed:** Add `BITMAGNET_TORZNAB_CATEGORY_MAP`, `rewrite_torznab_item_category`, `parse_requested_torznab_categories`, and `merge_unclassified_torznab_items` in `bitmagnet/bitmagnet_connector.py` so `:8097/torznab` promotes `Unknown` / `8000` (`Other`) Torznab items to their Armiger-classified Torznab category (`2000` `Movie`, `5000` `TV show`, `3000` `Music`, `3030` `Audiobook`, `7000` `E-book`, `7030` `Comic`, `4000` `Software`, `4050` `Game`, `6000` `XXX`) and rescues unclassified (`content_type IS NULL`) matches during category-restricted `tvsearch` / `movie` / `cat=` queries from Prowlarr, Sonarr, and Radarr. Add `POST /import` `contentType` hint writeback (`BitmagnetConnector.build_import_hint`, `repair_unknown_content_types`, `POST /v1/bitmagnet/repair-content-types`, and automatic startup/poll backfill) so Bitmagnet's Web UI and `torrent_contents.content_type` index are populated for torrents left as `Unknown` by Bitmagnet's built-in parser. Bump version to `1.2.6`.
+- **Why:** Stock Bitmagnet's built-in video classifier leaves `torrent_contents.content_type` as `NULL` (`Unknown`) whenever a release name lacks a 4-digit year or standard `SxxExx` token (and has no built-in rule for `game`), while GraphQL `TorrentMutation` only writes `torrent_tags` (`putTags`). As a result, torrents tagged `armiger-tv-show` or `armiger-movie` still appeared as `Unknown` in the Bitmagnet UI and `Other` (`8000`) in Prowlarr, and were excluded by Bitmagnet's SQL `WHERE content_type = ...` filter on Sonarr/Radarr category searches.
+- **Validation:** 48 tests pass (`pytest -v`), `python3 -W error -m py_compile`, `docker compose -f bitmagnet/docker-compose.yml config --quiet`, and `git diff --check`.
+- **Deployment:** None; pinned in `spencernorton/armiger`.
+- **Next step:** Tag `v1.2.6` after merge and update `spencernorton/armiger` connector pin.
+- **Status file updated:** Yes.
+
 ## 2026-10-28 — Use the complete 3.4.3 acceptance release
 
 - **Branch:** codex/runtime-acceptance
