@@ -10,7 +10,7 @@ services:
       ARMIGER_MODEL_DIR: /var/lib/armiger/model
       ARMIGER_HF_REPO: "${ARMIGER_HF_REPO:-NorviTech/armiger-ultra}"
       ARMIGER_AUTO_DOWNLOAD: "${ARMIGER_AUTO_DOWNLOAD:-true}"
-      ARMIGER_VARIANT: "${ARMIGER_VARIANT:-fp32}"
+      ARMIGER_VARIANT: "${ARMIGER_VARIANT:-ultra}"
       UPSTREAM_TORZNAB_URL: "${UPSTREAM_TORZNAB_URL:-http://prowlarr:9696/1/api}"
       ARMIGER_PROXY_HOST: "0.0.0.0"
       ARMIGER_PROXY_PORT: "8097"
@@ -34,8 +34,14 @@ services:
         for sub, fn in (("bitmagnet", "bitmagnet_connector.py"), ("arr-stack", "armiger_torznab_proxy.py")):
             dst = Path("/var/lib/armiger") / sub / fn
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if not dst.is_file():
-                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(dst))
+            tmp = dst.with_suffix(".py.tmp")
+            try:
+                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(tmp))
+                tmp.replace(dst)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                if not dst.is_file():
+                    raise
         '
         exec python3 /var/lib/armiger/arr-stack/armiger_torznab_proxy.py
     healthcheck:
@@ -79,8 +85,14 @@ services:
         for sub, fn in (("bitmagnet", "bitmagnet_connector.py"), ("arr-stack", "armiger_arr_webhook_receiver.py")):
             dst = Path("/var/lib/armiger") / sub / fn
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if not dst.is_file():
-                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(dst))
+            tmp = dst.with_suffix(".py.tmp")
+            try:
+                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(tmp))
+                tmp.replace(dst)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                if not dst.is_file():
+                    raise
         '
         exec python3 /var/lib/armiger/arr-stack/armiger_arr_webhook_receiver.py
     healthcheck:

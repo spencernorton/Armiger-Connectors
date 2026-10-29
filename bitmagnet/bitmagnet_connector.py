@@ -409,8 +409,9 @@ def resolve_bitmagnet_torznab_category(
 ) -> Optional[Tuple[int, str]]:
     """Map an Armiger prediction to stock Bitmagnet's Torznab `(category_id, category_label)`."""
     get = pred.get if isinstance(pred, Mapping) else lambda k, d=None: getattr(pred, k, d)
-    category = str(get("category") or "unknown").strip().lower()
-    adult = str(get("adult") or "non_adult").strip().lower()
+    heads = get("heads") if isinstance(get("heads"), Mapping) else {}
+    category = str(get("category") or _head_label(heads, "category", "unknown")).strip().lower()
+    adult = str(get("adult") or _head_label(heads, "adult", "non_adult")).strip().lower()
     if isolate_adult_namespace and adult == "adult" and category != "xxx":
         return BITMAGNET_TORZNAB_CATEGORY_MAP["xxx"]
     return BITMAGNET_TORZNAB_CATEGORY_MAP.get(category)
@@ -618,7 +619,10 @@ def filter_torznab_feed(
     rescued_item_keys: Optional[set[str]] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Filter a feed once, with connector-specific admission, category promotion, and annotation hooks."""
-    root = ET.fromstring(xml_bytes)
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes, {"total": 0, "admitted": 0, "blocked": 0, "blocked_reasons": {}}
     channel = root.find("channel")
     items = [] if channel is None else channel.findall("item")
     stats = {"total": len(items), "admitted": 0, "blocked": 0, "blocked_reasons": {}}
@@ -671,6 +675,28 @@ class JSONHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json_body(self, max_bytes: int = 10 * 1024 * 1024) -> Optional[Dict[str, Any]]:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self._send_json(400, {"error": "invalid_content_length"})
+            return None
+        if length < 0 or length > max_bytes:
+            status = 413 if length > max_bytes else 400
+            err = "payload_too_large" if length > max_bytes else "invalid_content_length"
+            self._send_json(status, {"error": err})
+            return None
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid_json"})
+            return None
+        if not isinstance(parsed, Mapping):
+            self._send_json(400, {"error": "invalid_json_object"})
+            return None
+        return dict(parsed)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -1427,13 +1453,19 @@ class BitmagnetConnector(ClassifierConnector):
                 has_next = False
                 break
 
+            unseen_in_page = 0
+            hinted_in_page = 0
             new_in_page = 0
             for item in raw_items:
                 t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
                 ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
-                if not ih or ih in seen_hashes or ih in self._hinted_hashes:
+                if not ih or ih in seen_hashes:
                     continue
                 seen_hashes.add(ih)
+                unseen_in_page += 1
+                if ih in self._hinted_hashes:
+                    hinted_in_page += 1
+                    continue
                 existing_ct = item.get("contentType")
                 if existing_ct is not None and str(existing_ct).strip().lower() not in ("", "unknown"):
                     continue
@@ -1456,7 +1488,7 @@ class BitmagnetConnector(ClassifierConnector):
 
             raw_has_next = search_data.get("hasNextPage")
             has_next = (len(raw_items) >= page_limit) if raw_has_next is None else bool(raw_has_next)
-            if not has_next or new_in_page == 0:
+            if not has_next or unseen_in_page == 0 or (new_in_page == 0 and hinted_in_page == 0):
                 has_next = False
                 break
             offset += len(raw_items)
@@ -1590,9 +1622,9 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
             self._send_json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            payload = json.loads(raw.decode("utf-8"))
+            payload = self._read_json_body()
+            if payload is None:
+                return
             if self.path == "/v1/bitmagnet/classify":
                 items = payload.get("torrents") or payload.get("items") or []
                 result = connector.evaluate_batch(items)

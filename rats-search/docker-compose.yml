@@ -39,8 +39,14 @@ services:
         for sub, fn in (("bitmagnet", "bitmagnet_connector.py"), ("rats-search", "rats_search_connector.py")):
             dst = Path("/var/lib/armiger") / sub / fn
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if not dst.is_file():
-                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(dst))
+            tmp = dst.with_suffix(".py.tmp")
+            try:
+                urllib.request.urlretrieve(f"{base}/{sub}/{fn}", str(tmp))
+                tmp.replace(dst)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                if not dst.is_file():
+                    raise
         '
         exec python3 /var/lib/armiger/rats-search/rats_search_connector.py
     healthcheck:

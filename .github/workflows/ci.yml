@@ -22,6 +22,11 @@ jobs:
         run: python3 -m pip install pytest
       - name: Run connector unit and protocol regressions
         run: python3 -m pytest -v
+      - name: Validate Compose manifests
+        run: |
+          docker compose -f bitmagnet/docker-compose.yml config --quiet
+          docker compose -f rats-search/docker-compose.yml config --quiet
+          docker compose -f arr-stack/docker-compose.yml config --quiet
   containers:
     name: Real containers (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -43,7 +48,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: spencernorton/armiger
-          ref: v3.4.3
+          ref: v3.8.0
           path: runtime
           persist-credentials: false
       - name: Pin the exact candidate connector revision in the image
@@ -55,8 +60,8 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/connector-build-cache
-          key: connector-runtime-v3.4.3-${{ matrix.arch }}-${{ hashFiles('candidate-connectors/bitmagnet/bitmagnet_connector.py', 'candidate-connectors/rats-search/rats_search_connector.py') }}
-          restore-keys: connector-runtime-v3.4.3-${{ matrix.arch }}-
+          key: connector-runtime-v3.8.0-${{ matrix.arch }}-${{ hashFiles('candidate-connectors/bitmagnet/bitmagnet_connector.py', 'candidate-connectors/rats-search/rats_search_connector.py') }}
+          restore-keys: connector-runtime-v3.8.0-${{ matrix.arch }}-
       - name: Build the native image with these connectors
         working-directory: runtime
         env:
@@ -71,7 +76,7 @@ jobs:
           fi
           docker buildx build --platform "linux/$CI_ARCH" --file examples/Dockerfile --load --provenance=false \
             --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
-            --label org.opencontainers.image.version=3.4.3 \
+            --label org.opencontainers.image.version=3.8.0 \
             --label "io.armiger.tested-connector-repository=$CANDIDATE_REPOSITORY" \
             --label "io.armiger.tested-connector-revision=$CANDIDATE_REVISION" \
             --tag "connector-ci:$CI_ARCH" "${CACHE_ARGS[@]}" \
@@ -100,8 +105,8 @@ jobs:
         run: |
           RUNTIME_ARGS=(--image "connector-ci:$CI_ARCH" --evidence "out/$CI_ARCH")
           if [ "$CI_ARCH" = amd64 ]; then
-            docker pull --platform linux/amd64 ghcr.io/spencernorton/armiger-rats-search:3.4.3
-            RUNTIME_ARGS+=(--rats-image ghcr.io/spencernorton/armiger-rats-search:3.4.3)
+            docker pull --platform linux/amd64 ghcr.io/spencernorton/armiger-rats-search:3.8.0
+            RUNTIME_ARGS+=(--rats-image ghcr.io/spencernorton/armiger-rats-search:3.8.0)
           fi
           python3 -m ci.runtime_acceptance "${RUNTIME_ARGS[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

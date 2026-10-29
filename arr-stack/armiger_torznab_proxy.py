@@ -1,6 +1,7 @@
 """Torznab admission proxy for Prowlarr and the *Arr stack."""
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from http.server import ThreadingHTTPServer
 import os
 from pathlib import Path
@@ -14,8 +15,53 @@ if str(_CONNECTOR_ROOT / "bitmagnet") not in sys.path:
     sys.path.insert(0, str(_CONNECTOR_ROOT / "bitmagnet"))
 
 from bitmagnet_connector import (  # noqa: E402
-    JSONHandler, extract_torznab_item_row, filter_torznab_feed, load_armiger_classifier,
+    JSONHandler,
+    _head_label,
+    extract_torznab_item_row,
+    filter_torznab_feed,
+    has_disguised_executable,
+    load_armiger_classifier,
+    parse_requested_torznab_categories,
 )
+
+
+def _pred_fields(pred: Any) -> Dict[str, Any]:
+    get = pred.get if isinstance(pred, Mapping) else lambda key, default=None: getattr(pred, key, default)
+    heads = get("heads") if isinstance(get("heads"), Mapping) else {}
+    category = str(get("category") or _head_label(heads, "category", "unknown"))
+    junk = str(get("junk") or _head_label(heads, "junk", "clean"))
+    lang = str(get("lang") or _head_label(heads, "lang", "multi_or_unknown"))
+    eng_subs = str(get("english_subs") or _head_label(heads, "english_subs", "unknown"))
+    csam_raw = get("csam_safety")
+    csam_dict = csam_raw if isinstance(csam_raw, Mapping) else {}
+    csam_safe = bool(csam_dict.get("is_safe", get("csam_safe", True)))
+    csam_reason = str(csam_dict.get("reason") or "csam_or_malware_blocked")
+    hp_raw = get("honeypot_trap")
+    honeypot = bool(hp_raw.get("is_honeypot_trap", False)) if isinstance(hp_raw, Mapping) else bool(hp_raw)
+    gates_raw = get("mondrian_gates")
+    gates_dict = gates_raw if isinstance(gates_raw, Mapping) else {}
+    mondrian_passed = bool(gates_dict.get("passed_all", get("mondrian_passed", True)))
+    mondrian_reason = str(gates_dict.get("safety_gate_reason") or "mondrian_gate_blocked")
+    sw_raw = get("swarm_viability")
+    sw_dict = sw_raw if isinstance(sw_raw, Mapping) else {}
+    viability_tier = str(sw_dict.get("viability_tier") or get("viability_tier") or "unknown")
+    viability_prob = float(sw_dict.get("viability_prob", get("viability_prob", 0.5)) or 0.5)
+    survival_net_prob = float(sw_dict.get("survival_net_prob", get("survival_net_prob", viability_prob)) or viability_prob)
+    disguised_exec = bool(get("disguised_executable", False))
+    return {
+        "category": category,
+        "junk": junk,
+        "lang": lang,
+        "english_subs": eng_subs,
+        "csam_safe": csam_safe,
+        "csam_reason": csam_reason,
+        "honeypot": honeypot,
+        "mondrian_passed": mondrian_passed,
+        "mondrian_reason": mondrian_reason,
+        "viability_tier": viability_tier,
+        "survival_net_prob": survival_net_prob,
+        "disguised_executable": disguised_exec,
+    }
 
 
 class ArmigerTorznabFilter:
@@ -40,39 +86,78 @@ class ArmigerTorznabFilter:
 
     _extract_item_row = staticmethod(extract_torznab_item_row)
 
+    def _classify_rows(self, rows: List[Dict[str, Any]]) -> Sequence[Any]:
+        if hasattr(self.pipeline, "classify_batch"):
+            raw_preds = self.pipeline.classify_batch(rows, use_zero_cue_catalog=self.use_zero_cue_catalog)
+        elif hasattr(self.pipeline, "predict_batch"):
+            raw_preds = self.pipeline.predict_batch(rows)
+        elif hasattr(self.pipeline, "classify"):
+            raw_preds = [self.pipeline.classify(r) for r in rows]
+        else:
+            raw_preds = [self.pipeline.predict(r) for r in rows]
+        checked: List[Any] = []
+        for row, pred in zip(rows, raw_preds):
+            fields = _pred_fields(pred)
+            if has_disguised_executable(str(row.get("name") or ""), row.get("files") or [], fields["category"]):
+                if isinstance(pred, Mapping):
+                    flagged = dict(pred)
+                    flagged["disguised_executable"] = True
+                    checked.append(flagged)
+                else:
+                    try:
+                        setattr(pred, "disguised_executable", True)
+                        checked.append(pred)
+                    except Exception:
+                        flagged = dict(fields)
+                        flagged["disguised_executable"] = True
+                        checked.append(flagged)
+            else:
+                checked.append(pred)
+        return checked
+
     def should_admit(self, pred: Any) -> Tuple[bool, str]:
         """Evaluate whether a Torznab release should be admitted to Sonarr/Radarr/Lidarr/Readarr."""
-        if not pred.csam_safety["is_safe"]:
-            return False, str(pred.csam_safety.get("reason") or "csam_or_malware_blocked")
-        if pred.honeypot_trap["is_honeypot_trap"]:
+        f = _pred_fields(pred)
+        if f["disguised_executable"]:
+            return False, "disguised_executable"
+        if not f["csam_safe"]:
+            return False, f["csam_reason"]
+        if f["honeypot"]:
             return False, "honeypot_trap_blocked"
-        if pred.junk == "junk" or not pred.mondrian_gates["passed_all"]:
-            return False, str(pred.mondrian_gates.get("safety_gate_reason") or "mondrian_gate_blocked")
+        if f["junk"] == "junk" or not f["mondrian_passed"]:
+            return False, f["mondrian_reason"]
 
-        if self.reject_dead_swarms and pred.swarm_viability["viability_tier"] == "dead":
+        if self.reject_dead_swarms and f["viability_tier"] in ("dead", "dead_known_zero"):
             return False, "dead_swarm_blocked"
 
-        if self.allowed_categories and pred.category not in self.allowed_categories:
-            return False, f"category_mismatch:{pred.category}"
+        if self.allowed_categories and f["category"] not in self.allowed_categories:
+            return False, f"category_mismatch:{f['category']}"
 
-        if self.require_english_audio and pred.lang == "non_english":
-            has_subs = pred.english_subs == "has_eng_subs"
+        if self.require_english_audio and f["lang"] == "non_english":
+            has_subs = f["english_subs"] == "has_eng_subs"
             if not (self.allow_english_subs and has_subs):
                 return False, "non_english_audio_blocked"
 
         return True, "admitted"
 
-    def filter_torznab_xml(self, xml_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
+    def filter_torznab_xml(
+        self,
+        xml_bytes: bytes,
+        *,
+        allowed_category_ids: Optional[set[int]] = None,
+    ) -> Tuple[bytes, Dict[str, Any]]:
         return filter_torznab_feed(
-            xml_bytes, self._extract_item_row,
-            lambda rows: self.pipeline.classify_batch(rows, use_zero_cue_catalog=self.use_zero_cue_catalog),
+            xml_bytes,
+            self._extract_item_row,
+            self._classify_rows,
             self.should_admit,
             lambda pred: (
-                ("armiger_category", pred.category),
-                ("armiger_lang", pred.lang),
-                ("armiger_viability", pred.swarm_viability["viability_tier"]),
-                ("armiger_survival_prob", f"{pred.swarm_viability['survival_net_prob']:.4f}"),
+                ("armiger_category", _pred_fields(pred)["category"]),
+                ("armiger_lang", _pred_fields(pred)["lang"]),
+                ("armiger_viability", _pred_fields(pred)["viability_tier"]),
+                ("armiger_survival_prob", f"{_pred_fields(pred)['survival_net_prob']:.4f}"),
             ),
+            allowed_category_ids=allowed_category_ids,
         )
 
 
@@ -103,16 +188,24 @@ def create_proxy_server(host: str = "localhost", port: int = 8097) -> ThreadingH
             if parsed.query:
                 target = f"{target}?{parsed.query}"
 
-            req = urllib.request.Request(target, method="GET")
-            with urllib.request.urlopen(req, timeout=15.0) as resp:
-                raw_xml = resp.read()
-                content_type = resp.headers.get("Content-Type", "application/rss+xml; charset=utf-8")
+            try:
+                req = urllib.request.Request(target, method="GET")
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    raw_xml = resp.read()
+                    content_type = resp.headers.get("Content-Type", "application/rss+xml; charset=utf-8")
+            except Exception as exc:
+                self._send_json(502, {"error": "upstream_torznab_error", "detail": str(exc)})
+                return
 
             if t_param in ("caps", ""):
                 out_bytes = raw_xml
                 stats = {"total": 0, "admitted": 0, "blocked": 0}
             else:
-                out_bytes, stats = torznab_filter.filter_torznab_xml(raw_xml)
+                allowed_cat_ids = parse_requested_torznab_categories(t_param, params.get("cat"))
+                out_bytes, stats = torznab_filter.filter_torznab_xml(
+                    raw_xml,
+                    allowed_category_ids=allowed_cat_ids,
+                )
 
             self.send_response(200)
             self.send_header("Content-Type", content_type)
