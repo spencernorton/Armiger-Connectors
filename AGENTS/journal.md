@@ -1,3 +1,16 @@
+## 2026-10-28 — Use the complete 3.4.3 acceptance release
+
+- **Branch:** codex/runtime-acceptance
+- **What changed:** Pin the prepared exact-source container gate to Armiger v3.4.3 and its Rats backend. The attempted 3.4.2 publication stopped at a Docker-list annotation check after functional acceptance, leaving an incomplete immutable registry tag. The corrected producer validates provenance in every tested native image config.
+- **Validation:** Wrapper actionlint and unit checks remain required. Native candidate checks start after the complete v3.4.3 producer release exists; the model and connector runtime source are unchanged.
+
+## 2026-10-28 — Require real native container and upstream acceptance
+
+- **Branch:** codex/runtime-acceptance
+- **What changed:** Keep the unit/protocol suite and require native amd64/arm64 container acceptance before the aggregate test check can pass. Use the immutable Armiger3.4.2 tooling/package, replace its connector pins with the exact checked-out candidate, and independently compare both bundled script hashes to that checkout. Run real models, stock Bitmagnet/Postgres batching/tags/repair/Torznab search, and the supported x86 Rats/Manticore write/readback/collision cases. Store logs and source/image evidence. Only GitHub-owned actions are used and no images are published by this repository's tests.
+- **Validation:** actionlint passes. Requires the verified Armiger3.4.2 release before native CI can run. The existing45-test suite remains required alongside acceptance. Legacy model-loader compatibility tests remain; container acceptance qualifies the released installed-package combination.
+- **Deployment:** No production change. Connector implementation and model data are unchanged.
+
 ## 2026-10-28 — Keep prebuilt-image instructions in the canonical setup guide
 
 - **Branch:** codex/canonical-image-guide
