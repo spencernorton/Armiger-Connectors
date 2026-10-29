@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
-  test:
+  unit:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -16,8 +19,104 @@ jobs:
         with:
           persist-credentials: false
       - name: Install test dependencies
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install pytest
-      - name: Run connector test suite
+        run: python3 -m pip install pytest
+      - name: Run connector unit and protocol regressions
         run: python3 -m pytest -v
+  containers:
+    name: Real containers (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate-connectors
+          persist-credentials: false
+      - name: Use the released acceptance tooling and package
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: spencernorton/armiger
+          ref: v3.4.2
+          path: runtime
+          persist-credentials: false
+      - name: Pin the exact candidate connector revision in the image
+        working-directory: runtime
+        env:
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+        run: python3 -m ci.pin_connectors --repository "$CANDIDATE_REPOSITORY" --revision "$CANDIDATE_REVISION"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/connector-build-cache
+          key: connector-runtime-v3.4.2-${{ matrix.arch }}-${{ hashFiles('candidate-connectors/bitmagnet/bitmagnet_connector.py', 'candidate-connectors/rats-search/rats_search_connector.py') }}
+          restore-keys: connector-runtime-v3.4.2-${{ matrix.arch }}-
+      - name: Build the native image with these connectors
+        working-directory: runtime
+        env:
+          CI_ARCH: ${{ matrix.arch }}
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_REVISION: ${{ github.sha }}
+        run: |
+          docker buildx create --use --driver docker-container
+          CACHE_ARGS=()
+          if [ -f "$RUNNER_TEMP/connector-build-cache/index.json" ]; then
+            CACHE_ARGS+=(--cache-from "type=local,src=$RUNNER_TEMP/connector-build-cache")
+          fi
+          docker buildx build --platform "linux/$CI_ARCH" --file examples/Dockerfile --load --provenance=false \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label org.opencontainers.image.version=3.4.2 \
+            --label "io.armiger.tested-connector-repository=$CANDIDATE_REPOSITORY" \
+            --label "io.armiger.tested-connector-revision=$CANDIDATE_REVISION" \
+            --tag "connector-ci:$CI_ARCH" "${CACHE_ARGS[@]}" \
+            --cache-to "type=local,dest=$RUNNER_TEMP/connector-build-cache-new,mode=max" .
+          rm -rf "$RUNNER_TEMP/connector-build-cache"
+          mv "$RUNNER_TEMP/connector-build-cache-new" "$RUNNER_TEMP/connector-build-cache"
+      - name: Verify the image contains the exact checked-out scripts
+        env:
+          CI_ARCH: ${{ matrix.arch }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          paths=('bitmagnet/bitmagnet_connector.py','rats-search/rats_search_connector.py')
+          expected={p:hashlib.sha256((Path('candidate-connectors')/p).read_bytes()).hexdigest() for p in paths}
+          code="import hashlib,json;from pathlib import Path;paths="+repr(paths)+";print(json.dumps({p:hashlib.sha256((Path('/opt/connectors')/p).read_bytes()).hexdigest() for p in paths}))"
+          actual=json.loads(subprocess.check_output(['docker','run','--rm','--network','none','connector-ci:'+os.environ['CI_ARCH'],'python','-c',code],text=True))
+          assert actual==expected, 'Image does not contain the current connector candidate'
+          dest=Path('runtime/out')/os.environ['CI_ARCH'];dest.mkdir(parents=True,exist_ok=True)
+          (dest/'connector-source.json').write_text(json.dumps({'repository':os.environ['GITHUB_REPOSITORY'],'revision':os.environ['GITHUB_SHA'],'scripts':actual},indent=2))
+          PYTHON
+      - name: Prove real model, Bitmagnet and Rats behavior
+        working-directory: runtime
+        env:
+          CI_ARCH: ${{ matrix.arch }}
+        run: |
+          RUNTIME_ARGS=(--image "connector-ci:$CI_ARCH" --evidence "out/$CI_ARCH")
+          if [ "$CI_ARCH" = amd64 ]; then
+            docker pull --platform linux/amd64 ghcr.io/spencernorton/armiger-rats-search:3.4.2
+            RUNTIME_ARGS+=(--rats-image ghcr.io/spencernorton/armiger-rats-search:3.4.2)
+          fi
+          python3 -m ci.runtime_acceptance "${RUNTIME_ARGS[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: connector-runtime-${{ matrix.arch }}
+          path: runtime/out/${{ matrix.arch }}/
+          retention-days: 14
+  test:
+    name: test
+    if: always()
+    needs: [unit, containers]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require unit regressions and both native upstream checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python3 -c 'import json,os; r=json.loads(os.environ["RESULTS"]); assert all(j["result"]=="success" for j in r.values()), r'

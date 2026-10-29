@@ -1,3 +1,10 @@
+## 2026-10-28 — Require real native container and upstream acceptance
+
+- **Branch:** codex/runtime-acceptance
+- **What changed:** Keep the unit/protocol suite and require native amd64/arm64 container acceptance before the aggregate test check can pass. Use the immutable Armiger3.4.2 tooling/package, replace its connector pins with the exact checked-out candidate, and independently compare both bundled script hashes to that checkout. Run real models, stock Bitmagnet/Postgres batching/tags/repair/Torznab search, and the supported x86 Rats/Manticore write/readback/collision cases. Store logs and source/image evidence. Only GitHub-owned actions are used and no images are published by this repository's tests.
+- **Validation:** actionlint passes. Requires the verified Armiger3.4.2 release before native CI can run. The existing45-test suite remains required alongside acceptance. Legacy model-loader compatibility tests remain; container acceptance qualifies the released installed-package combination.
+- **Deployment:** No production change. Connector implementation and model data are unchanged.
+
 ## 2026-10-28 — Keep prebuilt-image instructions in the canonical setup guide
 
 - **Branch:** codex/canonical-image-guide
