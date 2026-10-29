@@ -1,3 +1,10 @@
+## 2026-10-28 — Keep prebuilt-image instructions in the canonical setup guide
+
+- **Branch:** codex/canonical-image-guide
+- **What changed:** Remove the duplicated3.3.4 image pin from the Bitmagnet overview and direct prebuilt-container users to the current Armiger setup guide and configuration reference. The old pin retained the non-root directory-permission defect fixed in3.4.1.
+- **Validation:** Documentation-only change; connector test suite and protected CI required before merge.
+- **Deployment:** None. Connector source and model data are unchanged.
+
 ## 2026-10-27 — NorviTechGH — Canonical Bitmagnet viability tags and automatic legacy tag repair (v1.2.5)
 
 - **Branch:** fix/bitmagnet-viability-tags-and-repair
