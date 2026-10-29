@@ -162,9 +162,9 @@ def create_webhook_server(host: str = "localhost", port: int = 8098) -> Threadin
                 self._send_json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            payload = json.loads(raw.decode("utf-8"))
+            payload = self._read_json_body()
+            if payload is None:
+                return
             if self.path in ROUTE_TO_ADAPTER:
                 res = service.process_webhook(self.path, payload)
                 self._send_json(200, res)

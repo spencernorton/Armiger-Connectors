@@ -166,3 +166,59 @@ def test_webhook_feedback_preserves_ffprobe_and_explicit_sharing():
     result = service.process_webhook("/webhooks/radarr", {"movieFile": {"path": "/media/Sintel.mkv"}})
     assert result["verified"] is True
     assert calls == [{"adapter": "movie_webhook", "ffprobe_output": {"path": "/media/Sintel.mkv"}}]
+
+
+def test_arr_proxy_dict_predictions_disguised_executable_and_upstream_502(monkeypatch):
+    """ArmigerTorznabFilter must accept dict predictions (ArmigerONNXClassifier), block disguised executables, and return 502 on upstream failure."""
+    dict_pred = {
+        "heads": {
+            "category": {"label": "movie"},
+            "junk": {"label": "clean"},
+            "lang": {"label": "english"},
+            "english_subs": {"label": "unknown"},
+        },
+        "mondrian_gates": {"passed_all": True},
+        "csam_safety": {"is_safe": True},
+        "honeypot_trap": {"is_honeypot_trap": False},
+        "swarm_viability": {"viability_tier": "alive_viable", "survival_net_prob": 0.85},
+    }
+    gate = proxy.ArmigerTorznabFilter(
+        SimpleNamespace(predict_batch=lambda rows: [dict(dict_pred) for _ in rows]),
+    )
+    assert gate.should_admit(dict_pred) == (True, "admitted")
+
+    feed = (
+        b'<rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>'
+        b'<item><title>Sintel.2010.1080p.mkv</title><category>Unknown</category><torznab:attr name="category" value="8000"/></item>'
+        b'<item><title>Malware.Lure.2025.1080p.mkv.exe</title><category>Unknown</category><torznab:attr name="category" value="8000"/></item>'
+        b'</channel></rss>'
+    )
+    out_xml, stats = gate.filter_torznab_xml(feed, allowed_category_ids={2000})
+    assert stats["total"] == 2
+    assert stats["admitted"] == 1
+    assert stats["blocked"] == 1
+    assert stats["blocked_reasons"] == {"disguised_executable": 1}
+    assert b"Sintel.2010.1080p.mkv" in out_xml
+    assert b"Malware.Lure.2025.1080p.mkv.exe" not in out_xml
+    assert b'name="category" value="2000"' in out_xml
+
+    # Malformed XML returns input gracefully without crashing
+    bad_xml = b"<rss><channel><item><title>Unclosed"
+    assert gate.filter_torznab_xml(bad_xml)[0] == bad_xml
+
+    # Proxy HTTP server returns 502 JSON when upstream is unreachable
+    monkeypatch.setattr(proxy, "load_armiger_classifier", lambda *a, **kw: SimpleNamespace(predict_batch=lambda rows: []))
+    monkeypatch.setenv("UPSTREAM_TORZNAB_URL", "http://127.0.0.1:1/torznab")
+    srv = proxy.create_proxy_server("127.0.0.1", 0)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/api?t=search&q=sintel", timeout=3)
+        assert exc_info.value.code == 502
+        err_body = json.loads(exc_info.value.read().decode("utf-8"))
+        assert err_body["error"] == "upstream_torznab_error"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=3)

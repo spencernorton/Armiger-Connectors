@@ -1,3 +1,13 @@
+## 2026-10-29 — NorviTechGH — Harden connector pagination, Torznab proxy dict predictions, Compose scripts, and CI (v1.2.7)
+
+- **Branch:** fix/connector-hardening-and-ci
+- **What changed:** Fix `BitmagnetConnector.repair_unknown_content_types` pagination so pages containing already-hinted (`_hinted_hashes`) items advance `offset` instead of terminating early with `complete=True` while Bitmagnet's async `/import` queue is draining. Fix `resolve_bitmagnet_torznab_category` and `arr-stack/armiger_torznab_proxy.py` (`ArmigerTorznabFilter`) to support `ArmigerONNXClassifier` dict predictions (`heads.*.label`), enforce `has_disguised_executable`, handle malformed upstream XML without crashing, and return `502` JSON on upstream Torznab errors. Add bounded JSON body validation (`JSONHandler._read_json_body`) across `bitmagnet_connector.py`, `rats_search_connector.py`, and `armiger_arr_webhook_receiver.py`. Update `bitmagnet/docker-compose.yml` to honor `POSTGRES_PASSWORD`, atomically refresh connector scripts on startup in `rats-search/docker-compose.yml` and `arr-stack/docker-compose.yml`, validate all three Compose files in `.github/workflows/ci.yml`, and advance the CI runtime acceptance pin from `v3.4.3` to `v3.8.0`. Bump version to `1.2.7`.
+- **Why:** Prevent premature backfill completion on multi-page `Unknown` queues, `AttributeError` crashes when `armiger_torznab_proxy.py` runs with dict-returning ONNX classifiers, unhandled 500 traces on malformed POST bodies or upstream Torznab failures, and stale cached connector scripts in Docker volumes.
+- **Validation:** 51 tests pass (`pytest -v`), `python3 -W error -m py_compile`, `docker compose config --quiet` on all 3 Compose files, and `git diff --check`.
+- **Deployment:** None; pinned in `spencernorton/armiger`.
+- **Next step:** Tag `v1.2.7` after merge and update `spencernorton/armiger` `examples/Dockerfile` pin.
+- **Status file updated:** Yes.
+
 ## 2026-10-29 — NorviTechGH — Sync Bitmagnet contentType hints and promote Unknown/8000 Torznab categories (v1.2.6)
 
 - **Branch:** fix/bitmagnet-torznab-categories

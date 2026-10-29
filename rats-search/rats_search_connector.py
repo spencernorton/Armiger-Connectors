@@ -536,9 +536,9 @@ def create_server(connector: RatsSearchConnector, host: str = "127.0.0.1", port:
                 self._send_json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            payload = json.loads(raw.decode("utf-8"))
+            payload = self._read_json_body()
+            if payload is None:
+                return
             if self.path == "/v1/rats-search/classify":
                 items = payload.get("torrents") or payload.get("items") or []
                 result = connector.evaluate_batch(items)

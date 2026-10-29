@@ -1283,3 +1283,102 @@ def test_bitmagnet_sync_and_repair_unknown_content_types_via_import_endpoint() -
         "size": 4_100_000_000,
         "contentType": "movie",
     }]
+
+
+
+def test_repair_unknown_content_types_advances_past_already_hinted_pages() -> None:
+    """When page 0 still contains items in `_hinted_hashes` (awaiting Bitmagnet's async `/import` worker), `repair_unknown_content_types` must page forward to page 1 instead of breaking early with `complete=True`."""
+    page0 = [
+        {
+            "infoHash": f"{201:040x}",
+            "contentType": None,
+            "title": "Already Hinted TV",
+            "seeders": 10,
+            "leechers": 1,
+            "torrent": {
+                "infoHash": f"{201:040x}",
+                "name": "Caminandes.S01E01.1080p",
+                "size": 1_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 10,
+                "leechers": 1,
+                "tagNames": ["armiger-tv-show"],
+            },
+        }
+    ]
+    page1 = [
+        {
+            "infoHash": f"{202:040x}",
+            "contentType": None,
+            "title": "Unhinted Movie On Page 1",
+            "seeders": 15,
+            "leechers": 2,
+            "torrent": {
+                "infoHash": f"{202:040x}",
+                "name": "Sintel.2010.1080p",
+                "size": 2_000_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 15,
+                "leechers": 2,
+                "tagNames": ["armiger-movie"],
+            },
+        }
+    ]
+
+    def fake_graphql(url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        inp = (payload.get("variables") or {}).get("input") or {}
+        off = int(inp.get("offset") or 0)
+        if off == 0:
+            return {"data": {"torrentContent": {"search": {"hasNextPage": True, "items": page0}}}}
+        return {"data": {"torrentContent": {"search": {"hasNextPage": False, "items": page1}}}}
+
+    submitted: List[Dict[str, Any]] = []
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        graphql_url="http://bitmagnet:3333/graphql",
+        graphql_transport=fake_graphql,
+        import_transport=lambda url, hints: (submitted.extend(dict(h) for h in hints) or len(hints)),
+    )
+    # Mark page 0 item as already hinted on a previous tick
+    connector._mark_hinted(f"{201:040x}")
+
+    res = connector.repair_unknown_content_types(limit=1, max_pages=5, apply_mutations=True)
+    assert res["repairedCount"] == 1
+    assert res["submittedCount"] == 1
+    assert res["byContentType"] == {"movie": 1}
+    assert res["complete"] is True
+    assert [h["infoHash"] for h in submitted] == [f"{202:040x}"]
+
+
+def test_http_servers_reject_malformed_json_post_bodies() -> None:
+    """Malformed JSON or non-object JSON POST bodies must return 400 JSON instead of crashing the handler."""
+    import pytest
+    import urllib.error
+
+    bm_srv = create_bitmagnet_server(BitmagnetConnector(SyntheticArmigerClassifier()), host="127.0.0.1", port=0)
+    rs_srv = create_rats_server(RatsSearchConnector(SyntheticArmigerClassifier()), host="127.0.0.1", port=0)
+    threading.Thread(target=bm_srv.serve_forever, daemon=True).start()
+    threading.Thread(target=rs_srv.serve_forever, daemon=True).start()
+    try:
+        for port, path in (
+            (bm_srv.server_address[1], "/v1/bitmagnet/classify"),
+            (rs_srv.server_address[1], "/v1/rats-search/classify"),
+        ):
+            for bad_body, expected_err in ((b"{not-json", "invalid_json"), (b"[1, 2, 3]", "invalid_json_object")):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=bad_body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with pytest.raises(urllib.error.HTTPError) as exc_info:
+                    urllib.request.urlopen(req, timeout=3.0)
+                assert exc_info.value.code == 400
+                assert json.loads(exc_info.value.read().decode("utf-8"))["error"] == expected_err
+    finally:
+        bm_srv.shutdown()
+        bm_srv.server_close()
+        rs_srv.shutdown()
+        rs_srv.server_close()
