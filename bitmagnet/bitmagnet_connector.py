@@ -34,6 +34,32 @@ BITMAGNET_CONTENT_TYPE_MAP: Dict[str, Optional[str]] = {
     "unknown": None,
 }
 
+BITMAGNET_TORZNAB_CATEGORY_MAP: Dict[str, Tuple[int, str]] = {
+    "movie": (2000, "Movie"),
+    "tv_show": (5000, "TV show"),
+    "music": (3000, "Music"),
+    "audiobook": (3030, "Audiobook"),
+    "ebook": (7000, "E-book"),
+    "course": (7000, "E-book"),
+    "comic": (7030, "Comic"),
+    "software": (4000, "Software"),
+    "game": (4050, "Game"),
+    "xxx": (6000, "XXX"),
+}
+
+ARMIGER_CATEGORY_TAG_TO_CONTENT_TYPE: Dict[str, str] = {
+    "armiger-movie": "movie",
+    "armiger-tv-show": "tv_show",
+    "armiger-music": "music",
+    "armiger-ebook": "ebook",
+    "armiger-audiobook": "audiobook",
+    "armiger-comic": "comic",
+    "armiger-software": "software",
+    "armiger-game": "game",
+    "armiger-course": "ebook",
+    "armiger-xxx": "xxx",
+}
+
 _DISGUISED_EXEC_RE = re.compile(
     r"\.(?:mkv|mp4|avi|mov|wmv|flv|webm|mp3|flac|m4b|epub|pdf|cbz|cbr|srt|ass)"
     r"\.(?:exe|scr|bat|cmd|ps1|vbs|js|hta|msi|com|pif|lnk)$",
@@ -378,14 +404,220 @@ def extract_torznab_item_row(item_elem: ET.Element) -> Dict[str, Any]:
     }
 
 
+def resolve_bitmagnet_torznab_category(
+    pred: Any, *, isolate_adult_namespace: bool = True
+) -> Optional[Tuple[int, str]]:
+    """Map an Armiger prediction to stock Bitmagnet's Torznab `(category_id, category_label)`."""
+    get = pred.get if isinstance(pred, Mapping) else lambda k, d=None: getattr(pred, k, d)
+    category = str(get("category") or "unknown").strip().lower()
+    adult = str(get("adult") or "non_adult").strip().lower()
+    if isolate_adult_namespace and adult == "adult" and category != "xxx":
+        return BITMAGNET_TORZNAB_CATEGORY_MAP["xxx"]
+    return BITMAGNET_TORZNAB_CATEGORY_MAP.get(category)
+
+
+def is_unclassified_torznab_item(item_elem: ET.Element) -> bool:
+    """Return True if a Torznab `<item>` has an `Unknown`/`Other` category or `8000` category attr."""
+    cat_text = (item_elem.findtext("category") or "").strip().lower()
+    cat_attrs = [
+        (attr.attrib.get("value") or "").strip().lower()
+        for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr")
+        if (attr.attrib.get("name") or "").strip().lower() == "category"
+    ]
+    if cat_text in ("", "unknown", "other", "8000"):
+        if not cat_attrs:
+            return True
+        if all(
+            v in ("", "0", "unknown", "other") or (v.isdigit() and 8000 <= int(v) < 9000)
+            for v in cat_attrs
+        ):
+            return True
+    if any(
+        v in ("unknown", "other") or (v.isdigit() and 8000 <= int(v) < 9000)
+        for v in cat_attrs
+    ):
+        return True
+    return False
+
+
+def rewrite_torznab_item_category(
+    item_elem: ET.Element,
+    pred: Any,
+    *,
+    isolate_adult_namespace: bool = True,
+) -> Optional[Tuple[int, str]]:
+    """Upgrade `Unknown`/`Other` (`8000`) Torznab item categories to the Armiger-predicted category."""
+    resolved = resolve_bitmagnet_torznab_category(pred, isolate_adult_namespace=isolate_adult_namespace)
+    if resolved is None:
+        return None
+    cat_id, cat_label = resolved
+    force_adult = isolate_adult_namespace and cat_id == 6000
+    if not force_adult and not is_unclassified_torznab_item(item_elem):
+        return resolved
+
+    cat_elem = item_elem.find("category")
+    if cat_elem is None:
+        cat_elem = ET.SubElement(item_elem, "category")
+        cat_elem.text = cat_label
+    elif force_adult or (cat_elem.text or "").strip().lower() in ("", "unknown", "other", "8000"):
+        cat_elem.text = cat_label
+
+    cat_attrs = [
+        attr
+        for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr")
+        if (attr.attrib.get("name") or "").strip().lower() == "category"
+    ]
+    if cat_attrs:
+        for attr in cat_attrs:
+            val = (attr.attrib.get("value") or "").strip().lower()
+            if (
+                force_adult
+                or val in ("", "0", "unknown", "other")
+                or (val.isdigit() and 8000 <= int(val) < 9000)
+            ):
+                attr.set("value", str(cat_id))
+    else:
+        ET.SubElement(item_elem, f"{{{TORZNAB_NS}}}attr", name="category", value=str(cat_id))
+    return resolved
+
+
+def parse_requested_torznab_categories(
+    t_param: str, cat_values: Optional[Sequence[str]] = None
+) -> Optional[set[int]]:
+    """Return the set of Bitmagnet Torznab category IDs matching `t` and `cat`, or None if unfiltered."""
+    t_clean = (t_param or "").strip().lower()
+    type_cats: Optional[set[int]] = None
+    if t_clean in ("movie", "movies"):
+        type_cats = {2000}
+    elif t_clean in ("tvsearch", "tv"):
+        type_cats = {5000}
+    elif t_clean == "music":
+        type_cats = {3000}
+    elif t_clean == "book":
+        type_cats = {7000, 7030, 3030}
+
+    raw_cats: List[int] = []
+    for raw in cat_values or ():
+        for part in str(raw or "").split(","):
+            part_s = part.strip()
+            if part_s.isdigit():
+                raw_cats.append(int(part_s))
+
+    explicit_cats: Optional[set[int]] = None
+    if raw_cats:
+        explicit_cats = set()
+        for cid in raw_cats:
+            if 2000 <= cid < 3000:
+                explicit_cats.add(2000)
+            elif cid == 3030:
+                explicit_cats.add(3030)
+            elif 3000 <= cid < 4000:
+                explicit_cats.add(3000)
+                if cid == 3000:
+                    explicit_cats.add(3030)
+            elif 4000 <= cid < 5000:
+                explicit_cats.update((4000, 4050))
+            elif 5000 <= cid < 6000:
+                explicit_cats.add(5000)
+            elif 6000 <= cid < 7000:
+                explicit_cats.add(6000)
+            elif cid == 7030:
+                explicit_cats.add(7030)
+            elif 7000 <= cid < 8000:
+                explicit_cats.update((7000, 7030, 3030))
+            elif 8000 <= cid < 9000:
+                explicit_cats.add(8000)
+
+    if type_cats is not None and explicit_cats is not None:
+        intersected = type_cats & explicit_cats
+        return intersected if intersected else (type_cats | explicit_cats)
+    return explicit_cats if explicit_cats is not None else type_cats
+
+
+def _torznab_item_dedup_key(item_elem: ET.Element) -> str:
+    for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr"):
+        if (attr.attrib.get("name") or "").strip().lower() == "infohash":
+            ih = (attr.attrib.get("value") or "").strip().lower()
+            if ih:
+                return f"ih:{ih}"
+    guid = (item_elem.findtext("guid") or "").strip().lower()
+    if guid:
+        return f"guid:{guid}"
+    title = (item_elem.findtext("title") or "").strip().lower()
+    return f"title:{title}"
+
+
+def _title_matches_season_ep(
+    title: str, season: Optional[str] = None, ep: Optional[str] = None
+) -> bool:
+    s_str = (season or "").strip()
+    e_str = (ep or "").strip()
+    s_num = int(s_str) if s_str.isdigit() else None
+    e_num = int(e_str) if e_str.isdigit() else None
+    if s_num is None and e_num is None:
+        return True
+    if s_num is not None and e_num is not None:
+        pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}[\s._-]*e0*{e_num}|0*{s_num}x0*{e_num})(?:$|[\s._\-\]\)a-z])"
+        return bool(re.search(pat, title))
+    if s_num is not None:
+        pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}(?:[\s._-]*e\d+|$|[\s._\-\]\)])|season[\s._-]*0*{s_num}(?:$|[\s._\-\]\)])|0*{s_num}x\d+)"
+        return bool(re.search(pat, title))
+    pat = rf"(?i)(?:^|[\s._\-\[\(])(?:e0*{e_num}|ep(?:isode)?[\s._-]*0*{e_num}|-\s*0*{e_num})(?:$|[\s._\-\]\)])"
+    return bool(re.search(pat, title))
+
+
+def merge_unclassified_torznab_items(
+    primary_xml: bytes,
+    fallback_xml: bytes,
+    *,
+    season: Optional[str] = None,
+    ep: Optional[str] = None,
+) -> Tuple[bytes, set[str]]:
+    """Append unclassified (`Unknown` / `8000`) items from `fallback_xml` not already in `primary_xml`."""
+    try:
+        primary_root = ET.fromstring(primary_xml)
+        fallback_root = ET.fromstring(fallback_xml)
+    except ET.ParseError:
+        return primary_xml, set()
+    primary_channel = primary_root.find("channel")
+    fallback_channel = fallback_root.find("channel")
+    if primary_channel is None or fallback_channel is None:
+        return primary_xml, set()
+
+    existing_keys = {
+        _torznab_item_dedup_key(it) for it in primary_channel.findall("item")
+    }
+    rescued_keys: set[str] = set()
+    for item in fallback_channel.findall("item"):
+        key = _torznab_item_dedup_key(item)
+        if not key or key in existing_keys:
+            continue
+        if not is_unclassified_torznab_item(item):
+            continue
+        title = (item.findtext("title") or "").strip()
+        if not _title_matches_season_ep(title, season=season, ep=ep):
+            continue
+        existing_keys.add(key)
+        rescued_keys.add(key)
+        primary_channel.append(item)
+
+    if not rescued_keys:
+        return primary_xml, set()
+    return ET.tostring(primary_root, encoding="utf-8", xml_declaration=True), rescued_keys
+
+
 def filter_torznab_feed(
     xml_bytes: bytes,
     extract_row: Callable[[ET.Element], Dict[str, Any]],
     classify: Callable[[List[Dict[str, Any]]], Sequence[Any]],
     should_admit: Callable[[Any], Tuple[bool, str]],
     attributes: Callable[[Any], Sequence[Tuple[str, Any]]],
+    *,
+    isolate_adult_namespace: bool = True,
+    allowed_category_ids: Optional[set[int]] = None,
+    rescued_item_keys: Optional[set[str]] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    """Filter a feed once, with connector-specific admission and annotation hooks."""
+    """Filter a feed once, with connector-specific admission, category promotion, and annotation hooks."""
     root = ET.fromstring(xml_bytes)
     channel = root.find("channel")
     items = [] if channel is None else channel.findall("item")
@@ -393,7 +625,28 @@ def filter_torznab_feed(
     if not items:
         return xml_bytes, stats
     predictions = classify([extract_row(item) for item in items])
+    rescued = rescued_item_keys or set()
     for item, pred in zip(items, predictions):
+        item_key = _torznab_item_dedup_key(item)
+        is_rescued = item_key in rescued
+        resolved_cat = resolve_bitmagnet_torznab_category(
+            pred, isolate_adult_namespace=isolate_adult_namespace
+        )
+        if (
+            allowed_category_ids is not None
+            and 8000 not in allowed_category_ids
+            and (is_rescued or is_unclassified_torznab_item(item))
+        ):
+            if resolved_cat is None or resolved_cat[0] not in allowed_category_ids:
+                channel.remove(item)
+                if is_rescued:
+                    stats["total"] = max(0, stats["total"] - 1)
+                else:
+                    stats["blocked"] += 1
+                    reasons = stats["blocked_reasons"]
+                    reasons["category_mismatch"] = reasons.get("category_mismatch", 0) + 1
+                continue
+
         admit, reason = should_admit(pred)
         if not admit:
             channel.remove(item)
@@ -402,6 +655,9 @@ def filter_torznab_feed(
             reasons[reason] = reasons.get(reason, 0) + 1
             continue
         stats["admitted"] += 1
+        rewrite_torznab_item_category(
+            item, pred, isolate_adult_namespace=isolate_adult_namespace
+        )
         for name, value in attributes(pred):
             ET.SubElement(item, f"{{{TORZNAB_NS}}}attr", name=name, value=str(value))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True), stats
@@ -478,7 +734,10 @@ class BitmagnetConnector(ClassifierConnector):
         *,
         graphql_url: str = "http://localhost:3333/graphql",
         upstream_torznab_url: str = "http://localhost:3333/torznab",
+        import_url: Optional[str] = None,
         graphql_transport: Optional[Callable[[str, Mapping[str, Any]], Dict[str, Any]]] = None,
+        import_transport: Optional[Callable[[str, Sequence[Mapping[str, Any]]], int]] = None,
+        sync_content_type_hints: bool = True,
         prune_malware_and_honeypots: bool = True,
         prune_dead_swarms: bool = False,
         isolate_adult_namespace: bool = True,
@@ -490,7 +749,20 @@ class BitmagnetConnector(ClassifierConnector):
         self.classifier = classifier
         self.graphql_url = graphql_url
         self.upstream_torznab_url = upstream_torznab_url.rstrip("/")
+        if import_url:
+            self.import_url = import_url.rstrip("/")
+        elif graphql_url.rstrip("/").endswith("/graphql"):
+            self.import_url = graphql_url.rstrip("/")[: -len("/graphql")] + "/import"
+        else:
+            self.import_url = graphql_url.rstrip("/") + "/import"
         self._transport = graphql_transport or self._default_graphql_transport
+        if import_transport is not None:
+            self._import_transport = import_transport
+        elif graphql_transport is None:
+            self._import_transport = self._default_import_transport
+        else:
+            self._import_transport = lambda url, hints: len(hints)
+        self.sync_content_type_hints = sync_content_type_hints
         self.prune_malware_and_honeypots = prune_malware_and_honeypots
         self.prune_dead_swarms = prune_dead_swarms
         self.isolate_adult_namespace = isolate_adult_namespace
@@ -500,6 +772,7 @@ class BitmagnetConnector(ClassifierConnector):
         self.max_seen_cache = max_seen_cache
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._wave_seen: set[str] = set()
+        self._hinted_hashes: OrderedDict[str, None] = OrderedDict()
 
     @staticmethod
     def _default_graphql_transport(url: str, payload: Mapping[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
@@ -514,6 +787,85 @@ class BitmagnetConnector(ClassifierConnector):
         if isinstance(parsed, Mapping) and parsed.get("errors"):
             raise RuntimeError(f"Bitmagnet GraphQL error: {parsed['errors']}")
         return parsed
+
+    @staticmethod
+    def _default_import_transport(
+        url: str, hints: Sequence[Mapping[str, Any]], timeout: float = 15.0
+    ) -> int:
+        if not hints:
+            return 0
+        ndjson = "\n".join(json.dumps(h, separators=(",", ":")) for h in hints) + "\n"
+        req = urllib.request.Request(
+            url,
+            data=ndjson.encode("utf-8"),
+            headers={"Content-Type": "application/x-ndjson"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+        return len(hints)
+
+    def _mark_hinted(self, infohash: str) -> None:
+        if not infohash:
+            return
+        self._hinted_hashes[infohash] = None
+        self._hinted_hashes.move_to_end(infohash)
+        while len(self._hinted_hashes) > self.max_seen_cache:
+            self._hinted_hashes.popitem(last=False)
+
+    @staticmethod
+    def _is_sourceless_synthetic_row(item: Mapping[str, Any]) -> bool:
+        """Return True when a row was raw-SQL-seeded into `torrent_contents` without `torrents_torrent_sources`."""
+        t_obj = item.get("torrent")
+        if not isinstance(t_obj, Mapping) or "seeders" not in t_obj:
+            return False
+        return item.get("seeders") is not None and t_obj.get("seeders") is None
+
+    def _infer_content_type_from_tags(self, tag_names: Sequence[str]) -> Optional[str]:
+        norm_tags = {sanitize_bitmagnet_tag(t) for t in tag_names if t}
+        if self.isolate_adult_namespace and "armiger-xxx" in norm_tags:
+            return "xxx"
+        for tag, content_type in ARMIGER_CATEGORY_TAG_TO_CONTENT_TYPE.items():
+            if tag in norm_tags:
+                return content_type
+        return None
+
+    @staticmethod
+    def build_import_hint(
+        infohash: str,
+        name: str,
+        size: int,
+        content_type: Optional[str],
+        *,
+        source: str = "armiger",
+    ) -> Optional[Dict[str, Any]]:
+        """Build a stock Bitmagnet `POST /import` NDJSON item carrying a `contentType` hint."""
+        ih = str(infohash or "").strip().lower()
+        ct = str(content_type or "").strip().lower()
+        clean_name = str(name or "").strip()
+        if not ih or not ct or ct == "unknown" or not clean_name:
+            return None
+        return {
+            "source": source,
+            "infoHash": ih,
+            "name": clean_name,
+            "size": max(0, int(size or 0)),
+            "contentType": ct,
+        }
+
+    def _submit_import_hints(self, hints: Sequence[Mapping[str, Any]]) -> int:
+        if not hints or not self.sync_content_type_hints or not self.import_url:
+            return 0
+        try:
+            submitted = int(self._import_transport(self.import_url, hints) or 0)
+        except Exception as exc:
+            print(f"[bitmagnet-connector] import hint writeback warning: {exc}", file=sys.stderr, flush=True)
+            return 0
+        for h in hints:
+            ih = str(h.get("infoHash") or "").strip().lower()
+            if ih:
+                self._mark_hinted(ih)
+        return submitted
 
     @staticmethod
     def _item_to_row(item: Mapping[str, Any], files_by_hash: Optional[Mapping[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
@@ -619,8 +971,9 @@ class BitmagnetConnector(ClassifierConnector):
         actions: List[Dict[str, Any]] = []
         delete_hashes: List[str] = []
         grouped_tags: OrderedDict[Tuple[str, ...], List[str]] = OrderedDict()
+        import_hints: List[Dict[str, Any]] = []
 
-        for pred in preds:
+        for item, row, pred in zip(items, rows, preds):
             ih = pred["infohash"]
             is_unsafe = (not pred["csam_safe"]) or pred["disguised_executable"] or pred["junk"] == "junk"
             is_honeypot = bool(pred["honeypot_trap"])
@@ -712,6 +1065,15 @@ class BitmagnetConnector(ClassifierConnector):
                     "episode": pred["span_bio"].get("episode"),
                 }
             actions.append(action_entry)
+            existing_ct = item.get("contentType")
+            if (
+                bitmagnet_type is not None
+                and (existing_ct is None or str(existing_ct).strip().lower() in ("", "unknown"))
+                and not self._is_sourceless_synthetic_row(item)
+            ):
+                hint = self.build_import_hint(ih, row["name"], row["size"], bitmagnet_type)
+                if hint is not None:
+                    import_hints.append(hint)
 
         put_tags_mutations = [
             mut
@@ -726,6 +1088,7 @@ class BitmagnetConnector(ClassifierConnector):
             "actions": actions,
             "graphqlDeleteMutation": self.build_delete_mutation(delete_hashes),
             "graphqlPutTagsMutations": put_tags_mutations,
+            "importHints": import_hints,
         }
 
     def sync_once(self, limit: int = 100, apply_mutations: bool = True, max_pages: int = 12) -> Dict[str, Any]:
@@ -742,6 +1105,8 @@ class BitmagnetConnector(ClassifierConnector):
         wave_complete = False
         legacy_put_by_tag: OrderedDict[str, List[str]] = OrderedDict()
         legacy_delete_by_tag: OrderedDict[str, List[str]] = OrderedDict()
+        opportunistic_import_hints: List[Dict[str, Any]] = []
+        opportunistic_hint_hashes: set[str] = set()
 
         while len(untagged_items) < page_limit and pages_scanned < max_scan_pages:
             search_input: Dict[str, Any] = {
@@ -792,6 +1157,25 @@ class BitmagnetConnector(ClassifierConnector):
                 if ih in self._seen or has_armiger_tag:
                     if has_armiger_tag:
                         self._mark_seen(ih)
+                        existing_ct = item.get("contentType")
+                        if (
+                            self.sync_content_type_hints
+                            and (existing_ct is None or str(existing_ct).strip().lower() in ("", "unknown"))
+                            and ih not in self._hinted_hashes
+                            and ih not in opportunistic_hint_hashes
+                            and not self._is_sourceless_synthetic_row(item)
+                        ):
+                            inferred_ct = self._infer_content_type_from_tags(existing_tags)
+                            if inferred_ct is not None:
+                                hint = self.build_import_hint(
+                                    ih,
+                                    str(t_obj.get("name") or item.get("title") or ""),
+                                    int(t_obj.get("size") or item.get("size") or 0),
+                                    inferred_ct,
+                                )
+                                if hint is not None:
+                                    opportunistic_import_hints.append(hint)
+                                    opportunistic_hint_hashes.add(ih)
                     if ih in self._wave_seen:
                         page_wave_seen += 1
                         if pending_prior_hashes:
@@ -870,6 +1254,15 @@ class BitmagnetConnector(ClassifierConnector):
             result["graphqlRepairPutTagsMutations"] = repair_put_mutations
             result["graphqlRepairDeleteTagsMutations"] = repair_delete_mutations
 
+        combined_hints: List[Dict[str, Any]] = []
+        seen_hint_hashes: set[str] = set()
+        for hint in list(result.get("importHints") or []) + opportunistic_import_hints:
+            h_ih = str(hint.get("infoHash") or "").strip().lower()
+            if h_ih and h_ih not in seen_hint_hashes and h_ih not in self._hinted_hashes:
+                seen_hint_hashes.add(h_ih)
+                combined_hints.append(hint)
+        result["importHints"] = combined_hints
+
         if apply_mutations:
             if result["graphqlDeleteMutation"] is not None:
                 self._transport(self.graphql_url, result["graphqlDeleteMutation"])
@@ -879,6 +1272,8 @@ class BitmagnetConnector(ClassifierConnector):
                 self._transport(self.graphql_url, repair_put)
             for repair_del in repair_delete_mutations:
                 self._transport(self.graphql_url, repair_del)
+            if combined_hints:
+                result["importedHintCount"] = self._submit_import_hints(combined_hints)
 
         if wave_complete or not untagged_items:
             self._wave_seen.clear()
@@ -988,6 +1383,97 @@ class BitmagnetConnector(ClassifierConnector):
             "graphqlDeleteTagsMutations": delete_mutations,
         }
 
+    def repair_unknown_content_types(
+        self,
+        limit: int = 500,
+        max_pages: int = 20,
+        apply_mutations: bool = True,
+    ) -> Dict[str, Any]:
+        """Backfill Bitmagnet `contentType` via `POST /import` for `Unknown` torrents already tagged `armiger-*`."""
+        page_limit = max(1, int(limit))
+        max_scan_pages = max(1, int(max_pages))
+        offset = 0
+        pages = 0
+        seen_hashes: set[str] = set()
+        hints: List[Dict[str, Any]] = []
+        by_content_type: Dict[str, int] = {}
+        has_next = False
+        category_tags = list(ARMIGER_CATEGORY_TAG_TO_CONTENT_TYPE.keys())
+
+        while pages < max_scan_pages:
+            search_input: Dict[str, Any] = {
+                "limit": page_limit,
+                "hasNextPage": True,
+                "facets": {
+                    "contentType": {"filter": [None]},
+                    "torrentTag": {"logic": "or", "filter": category_tags},
+                },
+            }
+            if offset > 0:
+                search_input["offset"] = offset
+            resp = self._transport(
+                self.graphql_url,
+                {"query": GRAPHQL_RECENT_TORRENTS_QUERY, "variables": {"input": search_input}},
+            )
+            search_data = (
+                resp.get("data", {})
+                .get("torrentContent", {})
+                .get("search", {})
+            ) or {}
+            raw_items = search_data.get("items") or []
+            pages += 1
+
+            if not raw_items:
+                has_next = False
+                break
+
+            new_in_page = 0
+            for item in raw_items:
+                t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
+                ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
+                if not ih or ih in seen_hashes or ih in self._hinted_hashes:
+                    continue
+                seen_hashes.add(ih)
+                existing_ct = item.get("contentType")
+                if existing_ct is not None and str(existing_ct).strip().lower() not in ("", "unknown"):
+                    continue
+                if self._is_sourceless_synthetic_row(item):
+                    continue
+                existing_tags = t_obj.get("tagNames") or []
+                inferred_ct = self._infer_content_type_from_tags(existing_tags)
+                if inferred_ct is None:
+                    continue
+                hint = self.build_import_hint(
+                    ih,
+                    str(t_obj.get("name") or item.get("title") or ""),
+                    int(t_obj.get("size") or item.get("size") or 0),
+                    inferred_ct,
+                )
+                if hint is not None:
+                    hints.append(hint)
+                    by_content_type[inferred_ct] = by_content_type.get(inferred_ct, 0) + 1
+                    new_in_page += 1
+
+            raw_has_next = search_data.get("hasNextPage")
+            has_next = (len(raw_items) >= page_limit) if raw_has_next is None else bool(raw_has_next)
+            if not has_next or new_in_page == 0:
+                has_next = False
+                break
+            offset += len(raw_items)
+
+        submitted = 0
+        if apply_mutations and hints:
+            for idx in range(0, len(hints), page_limit):
+                submitted += self._submit_import_hints(hints[idx : idx + page_limit])
+
+        return {
+            "repairedCount": len(hints),
+            "submittedCount": submitted,
+            "byContentType": by_content_type,
+            "complete": not has_next,
+            "importHints": hints,
+        }
+
     _extract_torznab_item_row = staticmethod(extract_torznab_item_row)
 
     def should_admit_torznab(self, pred: Mapping[str, Any]) -> Tuple[bool, str]:
@@ -1006,9 +1492,17 @@ class BitmagnetConnector(ClassifierConnector):
                 return False, "non_english_audio_blocked"
         return True, "admitted"
 
-    def filter_torznab_xml(self, xml_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
+    def filter_torznab_xml(
+        self,
+        xml_bytes: bytes,
+        *,
+        allowed_category_ids: Optional[set[int]] = None,
+        rescued_item_keys: Optional[set[str]] = None,
+    ) -> Tuple[bytes, Dict[str, Any]]:
         return filter_torznab_feed(
-            xml_bytes, self._extract_torznab_item_row, self._run_batch_inference,
+            xml_bytes,
+            self._extract_torznab_item_row,
+            self._run_batch_inference,
             self.should_admit_torznab,
             lambda pred: (
                 ("armiger_category", pred["category"]),
@@ -1017,6 +1511,9 @@ class BitmagnetConnector(ClassifierConnector):
                 ("armiger_viability", pred["viability_tier"]),
                 ("armiger_survival_prob", f"{float(pred.get('survival_net_prob', pred['viability_prob'])):.4f}"),
             ),
+            isolate_adult_namespace=self.isolate_adult_namespace,
+            allowed_category_ids=allowed_category_ids,
+            rescued_item_keys=rescued_item_keys,
         )
 
 def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: int = 8096) -> ThreadingHTTPServer:
@@ -1049,7 +1546,36 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
                     out_bytes = raw_xml
                     stats = {"total": 0, "admitted": 0, "blocked": 0}
                 else:
-                    out_bytes, stats = connector.filter_torznab_xml(raw_xml)
+                    allowed_cat_ids = parse_requested_torznab_categories(t_param, params.get("cat"))
+                    rescued_keys: set[str] = set()
+                    has_ext_id = bool(params.get("imdbid") or params.get("tmdbid"))
+                    if allowed_cat_ids is not None and 8000 not in allowed_cat_ids and not has_ext_id:
+                        fb_pairs = [
+                            (k, v)
+                            for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+                            if k.lower() not in ("t", "cat", "season", "ep")
+                        ]
+                        fb_pairs.insert(0, ("t", "search"))
+                        fb_query = urllib.parse.urlencode(fb_pairs)
+                        fb_target = f"{connector.upstream_torznab_url}{subpath}?{fb_query}"
+                        if fb_target != target:
+                            try:
+                                fb_req = urllib.request.Request(fb_target, method="GET")
+                                with urllib.request.urlopen(fb_req, timeout=15.0) as fb_resp:
+                                    fb_xml = fb_resp.read()
+                                raw_xml, rescued_keys = merge_unclassified_torznab_items(
+                                    raw_xml,
+                                    fb_xml,
+                                    season=(params.get("season") or [None])[0],
+                                    ep=(params.get("ep") or [None])[0],
+                                )
+                            except Exception:
+                                pass
+                    out_bytes, stats = connector.filter_torznab_xml(
+                        raw_xml,
+                        allowed_category_ids=allowed_cat_ids,
+                        rescued_item_keys=rescued_keys,
+                    )
 
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
@@ -1075,12 +1601,24 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
                         connector._transport(connector.graphql_url, result["graphqlDeleteMutation"])
                     for tag_mut in result["graphqlPutTagsMutations"]:
                         connector._transport(connector.graphql_url, tag_mut)
+                    if result.get("importHints"):
+                        connector._submit_import_hints(result["importHints"])
                 self._send_json(200, result)
             elif self.path == "/v1/bitmagnet/repair-tags":
                 limit = int(payload.get("limit") or 500)
                 max_pages = int(payload.get("maxPages") or 20)
                 apply_mutations = bool(payload.get("applyMutations", True) and connector.graphql_url)
                 result = connector.repair_legacy_viability_tags(
+                    limit=limit,
+                    max_pages=max_pages,
+                    apply_mutations=apply_mutations,
+                )
+                self._send_json(200, result)
+            elif self.path == "/v1/bitmagnet/repair-content-types":
+                limit = int(payload.get("limit") or 500)
+                max_pages = int(payload.get("maxPages") or 20)
+                apply_mutations = bool(payload.get("applyMutations", True) and connector.graphql_url)
+                result = connector.repair_unknown_content_types(
                     limit=limit,
                     max_pages=max_pages,
                     apply_mutations=apply_mutations,
@@ -1103,10 +1641,14 @@ def main() -> None:
     mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "both").strip().lower()
 
     clf = load_armiger_classifier(model_dir, variant=variant, auto_download=auto_download)
+    import_url = os.environ.get("BITMAGNET_IMPORT_URL") or None
+    sync_content_type = os.environ.get("ARMIGER_SYNC_CONTENT_TYPE", "true").lower() == "true"
     connector = BitmagnetConnector(
         clf,
         graphql_url=graphql_url,
         upstream_torznab_url=upstream_torznab_url,
+        import_url=import_url,
+        sync_content_type_hints=sync_content_type,
         prune_malware_and_honeypots=os.environ.get("ARMIGER_PRUNE_MALWARE", "true").lower() == "true",
         prune_dead_swarms=os.environ.get("ARMIGER_PRUNE_DEAD_SWARMS", "false").lower() == "true",
         require_english_audio=os.environ.get("ARMIGER_REQUIRE_ENGLISH_AUDIO", "false").lower() == "true",
@@ -1144,6 +1686,7 @@ def main() -> None:
         flush=True,
     )
     legacy_repair_done = False
+    content_type_repair_done = not sync_content_type
     while True:
         try:
             if not legacy_repair_done:
@@ -1159,6 +1702,19 @@ def main() -> None:
                     )
                 if repair_res.get("complete", True):
                     legacy_repair_done = True
+            if not content_type_repair_done:
+                ct_res = connector.repair_unknown_content_types(
+                    limit=max(100, batch_size),
+                    apply_mutations=True,
+                )
+                if ct_res["repairedCount"] > 0:
+                    print(
+                        f"[bitmagnet-connector] backfilled {ct_res['repairedCount']} "
+                        f"unknown contentType hints ({ct_res['byContentType']})",
+                        flush=True,
+                    )
+                if ct_res.get("complete", True):
+                    content_type_repair_done = True
             connector.sync_once(limit=batch_size, apply_mutations=True)
         except Exception as exc:
             print(f"[bitmagnet-connector] poll error: {exc}", file=sys.stderr, flush=True)

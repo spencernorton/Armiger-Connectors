@@ -924,3 +924,362 @@ def test_installed_armiger_loader_uses_verified_data_without_cache_imports(monke
     rs_health = rs_conn.health_payload()
     for key in ("active_seq", "active_bundle_merkle_root", "model_source", "last_dht_check_ts", "sharing_status"):
         assert key in rs_health
+
+
+def test_bitmagnet_torznab_category_promotion_for_unknown_and_other_items() -> None:
+    """Torznab items returned by Bitmagnet as `Unknown` / `8000` (`Other`) must be promoted to their Armiger Torznab category."""
+    from bitmagnet_connector import TORZNAB_NS
+
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        require_english_audio=False,
+        reject_dead_swarms=True,
+    )
+    sample_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Bitmagnet Torznab</title>
+    <item>
+      <title>Caminandes.Season.01.Complete.1080p.WEBRip</title>
+      <category>Unknown</category>
+      <size>3200000000</size>
+      <torznab:attr name="infohash" value="aaaa111111111111111111111111111111111111"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="18"/>
+      <torznab:attr name="peers" value="20"/>
+    </item>
+    <item>
+      <title>Sintel.Open.Movie.1080p.BluRay.x264</title>
+      <category>Unknown</category>
+      <size>4200000000</size>
+      <torznab:attr name="infohash" value="bbbb222222222222222222222222222222222222"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="25"/>
+      <torznab:attr name="peers" value="28"/>
+    </item>
+    <item>
+      <title>Freedoom.Phase.1.Linux.tar</title>
+      <category>Other</category>
+      <size>850000000</size>
+      <torznab:attr name="infohash" value="cccc333333333333333333333333333333333333"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="14"/>
+      <torznab:attr name="peers" value="16"/>
+    </item>
+    <item>
+      <title>Tears.of.Steel.2012.1080p.BluRay</title>
+      <category>Movies/HD</category>
+      <size>3900000000</size>
+      <torznab:attr name="infohash" value="dddd444444444444444444444444444444444444"/>
+      <torznab:attr name="category" value="2040"/>
+      <torznab:attr name="seeders" value="30"/>
+      <torznab:attr name="peers" value="35"/>
+    </item>
+  </channel>
+</rss>"""
+
+    filtered_xml, stats = connector.filter_torznab_xml(sample_xml)
+    assert stats["total"] == 4
+    assert stats["admitted"] == 4
+    root = ET.fromstring(filtered_xml)
+    items = root.findall("./channel/item")
+    assert len(items) == 4
+
+    def _cat_info(elem: ET.Element) -> tuple[str, str]:
+        cat_text = elem.findtext("category") or ""
+        cat_attr = ""
+        for attr in elem.findall(f"{{{TORZNAB_NS}}}attr"):
+            if attr.attrib.get("name") == "category":
+                cat_attr = attr.attrib.get("value") or ""
+        return cat_text, cat_attr
+
+    # Unknown TV show -> TV show / 5000
+    assert _cat_info(items[0]) == ("TV show", "5000")
+    # Unknown Movie -> Movie / 2000
+    assert _cat_info(items[1]) == ("Movie", "2000")
+    # Other Game -> Game / 4050
+    assert _cat_info(items[2]) == ("Game", "4050")
+    # Already-classified Movies/HD (2040) -> preserved as Movies/HD / 2040
+    assert _cat_info(items[3]) == ("Movies/HD", "2040")
+
+
+def test_bitmagnet_torznab_proxy_rescues_unknown_items_for_sonarr_radarr_prowlarr_category_queries() -> None:
+    """Category-restricted Torznab queries (`t=tvsearch`, `t=movie`, `cat=5000`, `cat=2000`) must rescue `Unknown` items matching the requested category."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import urllib.parse
+    from bitmagnet_connector import TORZNAB_NS
+
+    tv_item_known = """
+    <item>
+      <title>Known.Show.S01E01.1080p.WEB</title>
+      <guid>1111111111111111111111111111111111111111</guid>
+      <category>TV show</category>
+      <size>1500000000</size>
+      <torznab:attr name="infohash" value="1111111111111111111111111111111111111111"/>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="seeders" value="22"/>
+      <torznab:attr name="peers" value="25"/>
+    </item>"""
+
+    tv_item_unknown_s01e02 = """
+    <item>
+      <title>Open.Series.S01E02.1080p.WEBRip</title>
+      <guid>2222222222222222222222222222222222222222</guid>
+      <category>Unknown</category>
+      <size>1600000000</size>
+      <torznab:attr name="infohash" value="2222222222222222222222222222222222222222"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="19"/>
+      <torznab:attr name="peers" value="21"/>
+    </item>"""
+
+    movie_item_unknown = """
+    <item>
+      <title>Open.Cinema.Feature.1080p.BluRay</title>
+      <guid>3333333333333333333333333333333333333333</guid>
+      <category>Unknown</category>
+      <size>4100000000</size>
+      <torznab:attr name="infohash" value="3333333333333333333333333333333333333333"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="31"/>
+      <torznab:attr name="peers" value="34"/>
+    </item>"""
+
+    def _wrap_rss(items_xml: str) -> bytes:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">'
+            f"<channel><title>Bitmagnet</title>{items_xml}</channel></rss>"
+        ).encode("utf-8")
+
+    class UpstreamBitmagnetHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            t_val = (params.get("t") or ["search"])[0].lower()
+            cat_val = ",".join(params.get("cat") or [])
+            # Stock Bitmagnet excludes content_type IS NULL rows whenever t=tvsearch/movie or cat=5000/2000 is set
+            if t_val == "tvsearch" or "5000" in cat_val or "5040" in cat_val:
+                body = _wrap_rss(tv_item_known)
+            elif t_val == "movie" or "2000" in cat_val or "2040" in cat_val:
+                body = _wrap_rss("")
+            else:
+                body = _wrap_rss(tv_item_known + tv_item_unknown_s01e02 + movie_item_unknown)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+    upstream_srv = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamBitmagnetHandler)
+    upstream_port = upstream_srv.server_address[1]
+    threading.Thread(target=upstream_srv.serve_forever, daemon=True).start()
+
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        upstream_torznab_url=f"http://127.0.0.1:{upstream_port}/torznab",
+    )
+    proxy_srv = create_bitmagnet_server(connector, host="127.0.0.1", port=0)
+    proxy_port = proxy_srv.server_address[1]
+    threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+    try:
+        # 1. Sonarr / Prowlarr TV query (`t=tvsearch&cat=5000,5040&q=Open`) rescues tv_item_unknown_s01e02 as 5000, excludes movie_item_unknown
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000,5040&q=Open",
+            timeout=5.0,
+        ) as resp:
+            tv_xml = resp.read()
+            assert resp.headers["X-Armiger-Total"] == "2"
+            assert resp.headers["X-Armiger-Admitted"] == "2"
+            assert resp.headers["X-Armiger-Blocked"] == "0"
+        tv_root = ET.fromstring(tv_xml)
+        tv_titles = [it.findtext("title") for it in tv_root.findall("./channel/item")]
+        assert tv_titles == [
+            "Known.Show.S01E01.1080p.WEB",
+            "Open.Series.S01E02.1080p.WEBRip",
+        ]
+        rescued_tv = tv_root.findall("./channel/item")[1]
+        assert rescued_tv.findtext("category") == "TV show"
+        assert any(
+            a.attrib.get("name") == "category" and a.attrib.get("value") == "5000"
+            for a in rescued_tv.findall(f"{{{TORZNAB_NS}}}attr")
+        )
+
+        # 2. Radarr / Prowlarr Movie query (`t=movie&cat=2000,2040&q=Open`) rescues movie_item_unknown as 2000, excludes TV items
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=movie&cat=2000,2040&q=Open",
+            timeout=5.0,
+        ) as resp:
+            movie_xml = resp.read()
+            assert resp.headers["X-Armiger-Total"] == "1"
+            assert resp.headers["X-Armiger-Admitted"] == "1"
+            assert resp.headers["X-Armiger-Blocked"] == "0"
+        movie_root = ET.fromstring(movie_xml)
+        movie_items = movie_root.findall("./channel/item")
+        assert len(movie_items) == 1
+        assert movie_items[0].findtext("title") == "Open.Cinema.Feature.1080p.BluRay"
+        assert movie_items[0].findtext("category") == "Movie"
+        assert any(
+            a.attrib.get("name") == "category" and a.attrib.get("value") == "2000"
+            for a in movie_items[0].findall(f"{{{TORZNAB_NS}}}attr")
+        )
+
+        # 3. Season/episode filter (`season=1&ep=9`) does not rescue S01E02 when episode mismatches
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000&q=Open&season=1&ep=9",
+            timeout=5.0,
+        ) as resp:
+            ep_xml = resp.read()
+        ep_titles = [it.findtext("title") for it in ET.fromstring(ep_xml).findall("./channel/item")]
+        assert "Open.Series.S01E02.1080p.WEBRip" not in ep_titles
+    finally:
+        proxy_srv.shutdown()
+        proxy_srv.server_close()
+        upstream_srv.shutdown()
+        upstream_srv.server_close()
+
+
+def test_bitmagnet_sync_and_repair_unknown_content_types_via_import_endpoint() -> None:
+    """`sync_once` and `repair_unknown_content_types` must write `contentType` hints to Bitmagnet `/import` for `Unknown` torrents."""
+    rows: List[Dict[str, Any]] = [
+        # Already tagged `armiger-tv-show` with contentType=None (the exact state reported by users upgrading)
+        {
+            "infoHash": f"{101:040x}",
+            "contentType": None,
+            "title": "Already Tagged TV Show",
+            "seeders": 14,
+            "leechers": 2,
+            "torrent": {
+                "infoHash": f"{101:040x}",
+                "name": "Caminandes.Season.01.1080p",
+                "size": 2_500_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 14,
+                "leechers": 2,
+                "tagNames": ["armiger-tv-show", "armiger-lang-english"],
+            },
+        },
+        # Newly crawled untagged movie with contentType=None
+        {
+            "infoHash": f"{102:040x}",
+            "contentType": None,
+            "title": "Untagged Movie",
+            "seeders": 25,
+            "leechers": 3,
+            "torrent": {
+                "infoHash": f"{102:040x}",
+                "name": "Sintel.Open.Film.1080p",
+                "size": 4_100_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": 25,
+                "leechers": 3,
+                "tagNames": [],
+            },
+        },
+        # Synthetic sourceless fixture (item.seeders=20, torrent.seeders=None) -> must NOT be sent to /import
+        {
+            "infoHash": f"{103:040x}",
+            "contentType": None,
+            "title": "Synthetic Seeded Fixture",
+            "seeders": 20,
+            "leechers": 2,
+            "torrent": {
+                "infoHash": f"{103:040x}",
+                "name": "Tears.of.Steel.2012.1080p.mkv",
+                "size": 2_400_000_000,
+                "filesCount": 1,
+                "hasFilesInfo": False,
+                "seeders": None,
+                "leechers": None,
+                "tagNames": ["armiger-movie"],
+            },
+        },
+    ]
+
+    imported_batches: List[List[Dict[str, Any]]] = []
+
+    def fake_graphql(url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        q = str(payload.get("query") or "")
+        variables = payload.get("variables") or {}
+        if "ArmigerRecentTorrents" in q:
+            inp = variables.get("input") or {}
+            facets = inp.get("facets") or {}
+            if "contentType" in facets:
+                matched = [
+                    r for r in rows
+                    if r.get("contentType") is None
+                    and any(t.startswith("armiger-") for t in (r["torrent"].get("tagNames") or []))
+                ]
+            else:
+                matched = list(rows)
+            return {
+                "data": {
+                    "torrentContent": {
+                        "search": {
+                            "hasNextPage": False,
+                            "items": matched,
+                        }
+                    }
+                }
+            }
+        if "TorrentPutTags" in q:
+            tag_hashes = set(variables.get("infoHashes") or [])
+            new_tags = list(variables.get("tagNames") or [])
+            for r in rows:
+                if r["infoHash"] in tag_hashes:
+                    existing = list(r["torrent"].get("tagNames") or [])
+                    r["torrent"]["tagNames"] = list(dict.fromkeys(existing + new_tags))
+            return {"data": {"torrent": {"putTags": None}}}
+        return {"data": {}}
+
+    def fake_import(url: str, hints: Sequence[Mapping[str, Any]]) -> int:
+        batch = [dict(h) for h in hints]
+        imported_batches.append(batch)
+        for h in batch:
+            for r in rows:
+                if r["infoHash"] == h["infoHash"]:
+                    r["contentType"] = h["contentType"]
+        return len(batch)
+
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        graphql_url="http://bitmagnet:3333/graphql",
+        graphql_transport=fake_graphql,
+        import_transport=fake_import,
+    )
+    assert connector.import_url == "http://bitmagnet:3333/import"
+
+    # 1. Explicit backfill of already-tagged Unknown torrents repairs 101 (tv_show) and skips synthetic 103
+    repair_res = connector.repair_unknown_content_types(limit=100, apply_mutations=True)
+    assert repair_res["repairedCount"] == 1
+    assert repair_res["submittedCount"] == 1
+    assert repair_res["byContentType"] == {"tv_show": 1}
+    assert rows[0]["contentType"] == "tv_show"
+    assert rows[2]["contentType"] is None
+
+    # 2. sync_once classifies untagged 102 (movie) and submits its contentType hint to /import
+    sync_res = connector.sync_once(limit=100, apply_mutations=True)
+    assert sync_res["total"] == 1
+    assert sync_res["importedHintCount"] == 1
+    assert rows[1]["contentType"] == "movie"
+    assert len(imported_batches) == 2
+    assert imported_batches[0] == [{
+        "source": "armiger",
+        "infoHash": f"{101:040x}",
+        "name": "Caminandes.Season.01.1080p",
+        "size": 2_500_000_000,
+        "contentType": "tv_show",
+    }]
+    assert imported_batches[1] == [{
+        "source": "armiger",
+        "infoHash": f"{102:040x}",
+        "name": "Sintel.Open.Film.1080p",
+        "size": 4_100_000_000,
+        "contentType": "movie",
+    }]
