@@ -1,3 +1,9 @@
+## 2026-10-30 — Explain the indexer and Torznab connector flows
+
+The README explains the product with a real interaction recording or a source-grounded
+architecture diagram. Recordings retain their source attribution and offer still
+images for reduced-motion viewing. No runtime behaviour is changed.
+
 ## 2026-10-29 — NorviTechGH — Harden connector pagination, Torznab proxy dict predictions, Compose scripts, and CI (v1.2.7)
 
 - **Branch:** fix/connector-hardening-and-ci

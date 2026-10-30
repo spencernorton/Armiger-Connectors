@@ -3,6 +3,24 @@
 Python sidecars connecting [Armiger](https://github.com/spencernorton/armiger)
 to stock Bitmagnet, Rats Search, and the *Arr stack.
 
+```mermaid
+flowchart LR
+    Indexers[Bitmagnet or Rats Search] --> Connector[Indexer connector]
+    Connector --> Model[Armiger classifier]
+    Model --> Connector
+    Connector --> Writeback[Tags and content categories]
+    Indexers --> Proxy[Torznab filter]
+    Model --> Proxy
+    Proxy --> Arr[Prowlarr and the Arr apps]
+    Arr --> Feedback[Post-import webhook]
+```
+
+Connectors adapt an indexer's metadata to Armiger and write supported labels
+back through that integration. The Torznab filter and post-import webhook are
+separate services; choose the [integration guide](#integration-guides) for your stack.
+
+## Integration guides
+
 | Integration | What it does | Setup |
 | --- | --- | --- |
 | Bitmagnet | Classifies torrents, batches GraphQL tags/deletions, filters Torznab results | [Guide](bitmagnet/README.md) |
