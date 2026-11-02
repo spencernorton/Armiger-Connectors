@@ -106,9 +106,11 @@ Stock Bitmagnet flushes newly crawled DHT torrents in batches of up to 1,000 ite
 | `ARMIGER_PROXY_PORT` | Optional | `"8097"` | Integer `"1"` – `"65535"` | Dedicated Torznab proxy port (`/torznab` and `/api`). |
 | `ARMIGER_ENABLE_TORZNAB_PROXY` | Optional | `"true"` | `"true"`, `"false"` | Starts the dedicated `ARMIGER_PROXY_PORT` listener in `"both"` or `"http"` mode. |
 
+Classification and proxy screening use metadata/filename rules, not antivirus or media-payload inspection. A passed safety or language gate is not a guarantee about file contents. INT8 inside this connector retains the Ultra components; its model file size is not its RAM footprint. See [resources](https://github.com/spencernorton/armiger/blob/main/docs/resources.md).
+
 ### Automatic model updates (BEP 44/46) and optional telemetry
 
-Armiger Ultra automatically checks for newer signed model/catalog bundles in the background, verifies their cryptographic signatures and 500-item canary regression suite, and hot-swaps them without restarting the container. **All release signing keys, DHT bootstrap routers, and Hugging Face HTTPS fallback mirrors are already built in out of the box** — you only need the 5 settings below:
+When updates are enabled, Armiger Ultra checks for newer signed model/catalog bundles in the background, verifies their cryptographic signatures and 500-item canary regression suite, and hot-swaps them without restarting the container. **All release signing keys, DHT bootstrap routers, and Hugging Face HTTPS fallback mirrors are already built in out of the box** — the legacy Compose file below enables DHT updates explicitly. With Armiger3.12.1 or newer, prefer `ARMIGER_UPDATE_CHANNEL=dht`, `hf` or `off`; an unset library channel does not imply automatic updating. The legacy `ARMIGER_DHT_AUTO_UPDATE` flag still maps to `dht`/`off`. Relevant settings follow:
 
 | Variable | Required / Optional | Default (`docker-compose.yml` / CLI) | Valid options / range | What it does |
 | --- | --- | --- | --- | --- |
