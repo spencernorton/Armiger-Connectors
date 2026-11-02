@@ -19,6 +19,8 @@ Connectors adapt an indexer's metadata to Armiger and write supported labels
 back through that integration. The Torznab filter and post-import webhook are
 separate services; choose the [integration guide](#integration-guides) for your stack.
 
+Filtering and category writeback use metadata predictions. They do not scan downloaded payloads or guarantee safe files, correct audio language or available downloads. Optional post-import file verification is a separate operation. See [model limits and resources](https://github.com/spencernorton/armiger/blob/main/docs/resources.md).
+
 ## Integration guides
 
 | Integration | What it does | Setup |
