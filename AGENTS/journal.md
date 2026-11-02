@@ -1,3 +1,8 @@
+## 2026-11-02 — Publish the approved connector documentation corrections
+
+- Publication is authorized for the prepared metadata-filtering, resource-scope and explicit-update-channel explanations. Connector source, defaults and model data are unchanged.
+- Relative links and patch hygiene pass. Ordinary protected-branch/native checks remain required before merge; no test or review bypass is authorized.
+
 ## 2026-11-02 — Prepare honest filtering/resource documentation
 
 - Qualify filename/model screening versus payload inspection and optional post-import verification. Link the resource scope for INT8-with-Ultra versus standalone inference, and explain the explicit channel required by newer Armiger libraries while retaining the legacy Compose behavior.
