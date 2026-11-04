@@ -1,3 +1,7 @@
+## 2026-11-03 — Bound CI status checks and superseded PR work
+
+Bound the final CI status job to five minutes while retaining every required upstream result. Validation: actionlint, workflow structure checks and the required native pull-request checks.
+
 ## 2026-11-02 — Publish the approved connector documentation corrections
 
 - Publication is authorized for the prepared metadata-filtering, resource-scope and explicit-update-channel explanations. Connector source, defaults and model data are unchanged.
