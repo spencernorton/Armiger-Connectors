@@ -1,5 +1,10 @@
 # Armiger Connectors
 
+[![CI](https://github.com/spencernorton/Armiger-Connectors/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/spencernorton/Armiger-Connectors/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/spencernorton/Armiger-Connectors?label=release)](https://github.com/spencernorton/Armiger-Connectors/releases)
+[![Apache-2.0 licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+[![Armiger on NorviTech](https://img.shields.io/badge/NorviTech-Armiger-FD8024.svg)](https://norvitech.com/ai-models/#armiger)
+
 Python sidecars connecting [Armiger](https://github.com/spencernorton/armiger)
 to stock Bitmagnet, Rats Search, and the *Arr stack.
 
@@ -55,4 +60,4 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
-[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Apache-2.0](LICENSE) · [Notice](NOTICE)
+[Support](SUPPORT.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Apache-2.0](LICENSE) · [Notice](NOTICE)
