@@ -79,6 +79,7 @@ python3 bitmagnet/bitmagnet_connector.py
 | `ARMIGER_CONNECTOR_MODE` | Optional | `"both"` | `"both"`, `"http"`, `"poll"` | `"both"` runs the background GraphQL poller and HTTP/Torznab listeners. `"http"` runs only HTTP/Torznab listeners. `"poll"` runs only the background poller. |
 | `BITMAGNET_POLL_SECONDS` | Optional | `"5"` (`5.0`) | Number `>= 1` *(recommended `"2"` – `"60"` seconds)* | Seconds between polling cycles. |
 | `BITMAGNET_BATCH_SIZE` | Optional | `"100"` | Integer `"10"` – `"1000"` *(recommended `"50"` – `"500"` items)* | Maximum untagged Bitmagnet torrents classified per cycle. Pages via `offset`/`hasNextPage` across multi-batch 60-second Bitmagnet `persistTorrents` flushes. |
+| `BITMAGNET_GRAPHQL_TIMEOUT_SECONDS` | Optional | `"10"` (`10.0`) | Number `> 0` *(recommended `"10"` – `"120"` seconds)* | Seconds to wait for each Bitmagnet GraphQL request. Raise it when Postgres is CPU-bound on a large catalog and queries take longer than 10 seconds. |
 
 Stock Bitmagnet flushes newly crawled DHT torrents in batches of up to 1,000 items or every 60 seconds. With `BITMAGNET_POLL_SECONDS="5"` and `BITMAGNET_BATCH_SIZE="100"`, the poller pages past items already tagged earlier in the active flush across consecutive cycles (up to 1,200 torrents/minute). If you raise `DHT_CRAWLER_SCALING_FACTOR` above `"30"` or poll less frequently, increase `BITMAGNET_BATCH_SIZE` so `(60 / BITMAGNET_POLL_SECONDS) * BITMAGNET_BATCH_SIZE` exceeds your crawler's per-minute intake.
 

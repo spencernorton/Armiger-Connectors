@@ -1404,6 +1404,34 @@ def test_poll_loop_syncs_even_when_content_type_repair_fails(monkeypatch) -> Non
     assert calls == ["repair", "sync"]
 
 
+def test_poll_loop_uses_graphql_timeout_from_env(monkeypatch) -> None:
+    """Large catalogs need more than 10 s per GraphQL query, so the poller must honor `BITMAGNET_GRAPHQL_TIMEOUT_SECONDS`."""
+    import bitmagnet_connector as bm
+
+    timeouts: List[float] = []
+
+    class StopLoop(Exception):
+        pass
+
+    def fake_urlopen(req, timeout=None):
+        timeouts.append(timeout)
+        raise TimeoutError("timed out")
+
+    def stop(_seconds):
+        raise StopLoop
+
+    monkeypatch.setenv("ARMIGER_CONNECTOR_MODE", "poll")
+    monkeypatch.setenv("BITMAGNET_GRAPHQL_TIMEOUT_SECONDS", "120")
+    monkeypatch.setattr(bm, "load_armiger_classifier", lambda *a, **k: SyntheticArmigerClassifier())
+    monkeypatch.setattr(bm.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bm.time, "sleep", stop)
+    try:
+        bm.main()
+    except StopLoop:
+        pass
+    assert timeouts and set(timeouts) == {120.0}
+
+
 def test_http_servers_reject_malformed_json_post_bodies() -> None:
     """Malformed JSON or non-object JSON POST bodies must return 400 JSON instead of crashing the handler."""
     import pytest
