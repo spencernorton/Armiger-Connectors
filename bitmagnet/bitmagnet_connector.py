@@ -1685,8 +1685,8 @@ def main() -> None:
     poll_interval = float(os.environ.get("BITMAGNET_POLL_SECONDS", "5.0"))
     batch_size = int(os.environ.get("BITMAGNET_BATCH_SIZE", "100"))
     graphql_timeout = float(os.environ.get("BITMAGNET_GRAPHQL_TIMEOUT_SECONDS", "10"))
-    if graphql_timeout <= 0:
-        raise SystemExit("BITMAGNET_GRAPHQL_TIMEOUT_SECONDS must be greater than 0")
+    if not 0 < graphql_timeout < float("inf"):  # also rejects nan
+        raise SystemExit("BITMAGNET_GRAPHQL_TIMEOUT_SECONDS must be a positive number of seconds")
     mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "both").strip().lower()
 
     clf = load_armiger_classifier(model_dir, variant=variant, auto_download=auto_download)
