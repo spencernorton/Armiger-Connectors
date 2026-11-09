@@ -1352,6 +1352,58 @@ def test_repair_unknown_content_types_advances_past_already_hinted_pages() -> No
     assert [h["infoHash"] for h in submitted] == [f"{202:040x}"]
 
 
+def test_repair_unknown_content_types_queries_one_tag_per_request() -> None:
+    """An OR of tag facets times out on very large catalogs, so every repair request must carry exactly one tag."""
+    inputs: List[Dict[str, Any]] = []
+
+    def fake_graphql(url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        inputs.append((payload.get("variables") or {}).get("input") or {})
+        return {"data": {"torrentContent": {"search": {"hasNextPage": False, "items": []}}}}
+
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        graphql_url="http://bitmagnet:3333/graphql",
+        graphql_transport=fake_graphql,
+    )
+    res = connector.repair_unknown_content_types(limit=10, max_pages=2, apply_mutations=False)
+    tags = [inp["facets"]["torrentTag"] for inp in inputs]
+    assert all("logic" not in t and len(t["filter"]) == 1 for t in tags)
+    assert len(tags) == len({t["filter"][0] for t in tags}) > 1
+    assert res["complete"] is True
+
+
+def test_poll_loop_syncs_even_when_content_type_repair_fails(monkeypatch) -> None:
+    """A failing contentType repair must be logged and must not stop `sync_once` in the same cycle."""
+    import bitmagnet_connector as bm
+
+    calls: List[str] = []
+
+    class StopLoop(Exception):
+        pass
+
+    def boom(self, **kwargs):
+        calls.append("repair")
+        raise TimeoutError("timed out")
+
+    def fake_sync(self, **kwargs):
+        calls.append("sync")
+
+    def stop(_seconds):
+        raise StopLoop
+
+    monkeypatch.setenv("ARMIGER_CONNECTOR_MODE", "poll")
+    monkeypatch.setattr(bm, "load_armiger_classifier", lambda *a, **k: SyntheticArmigerClassifier())
+    monkeypatch.setattr(bm.BitmagnetConnector, "repair_legacy_viability_tags", lambda self, **k: {"repairedCount": 0})
+    monkeypatch.setattr(bm.BitmagnetConnector, "repair_unknown_content_types", boom)
+    monkeypatch.setattr(bm.BitmagnetConnector, "sync_once", fake_sync)
+    monkeypatch.setattr(bm.time, "sleep", stop)
+    try:
+        bm.main()
+    except StopLoop:
+        pass
+    assert calls == ["repair", "sync"]
+
+
 def test_http_servers_reject_malformed_json_post_bodies() -> None:
     """Malformed JSON or non-object JSON POST bodies must return 400 JSON instead of crashing the handler."""
     import pytest

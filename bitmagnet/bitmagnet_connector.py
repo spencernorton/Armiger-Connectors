@@ -1415,83 +1415,94 @@ class BitmagnetConnector(ClassifierConnector):
         max_pages: int = 20,
         apply_mutations: bool = True,
     ) -> Dict[str, Any]:
-        """Backfill Bitmagnet `contentType` via `POST /import` for `Unknown` torrents already tagged `armiger-*`."""
+        """Backfill Bitmagnet `contentType` via `POST /import` for `Unknown` torrents already tagged `armiger-*`.
+
+        Searches one `armiger-*` tag per request: Bitmagnet turns an OR of tag facets into one
+        correlated EXISTS per tag, which times out on catalogs of tens of millions of torrents.
+        `limit` is the page size and `max_pages` is the page budget for each tag (so at most
+        `max_pages` requests per tag); `complete` is true only when every tag was exhausted.
+        """
         page_limit = max(1, int(limit))
         max_scan_pages = max(1, int(max_pages))
-        offset = 0
-        pages = 0
         seen_hashes: set[str] = set()
         hints: List[Dict[str, Any]] = []
         by_content_type: Dict[str, int] = {}
-        has_next = False
+        complete = True
         category_tags = list(ARMIGER_CATEGORY_TAG_TO_CONTENT_TYPE.keys())
 
-        while pages < max_scan_pages:
-            search_input: Dict[str, Any] = {
-                "limit": page_limit,
-                "hasNextPage": True,
-                "facets": {
-                    "contentType": {"filter": [None]},
-                    "torrentTag": {"logic": "or", "filter": category_tags},
-                },
-            }
-            if offset > 0:
-                search_input["offset"] = offset
-            resp = self._transport(
-                self.graphql_url,
-                {"query": GRAPHQL_RECENT_TORRENTS_QUERY, "variables": {"input": search_input}},
-            )
-            search_data = (
-                resp.get("data", {})
-                .get("torrentContent", {})
-                .get("search", {})
-            ) or {}
-            raw_items = search_data.get("items") or []
-            pages += 1
-
-            if not raw_items:
-                has_next = False
-                break
-
-            unseen_in_page = 0
-            hinted_in_page = 0
-            new_in_page = 0
-            for item in raw_items:
-                t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
-                ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
-                if not ih or ih in seen_hashes:
-                    continue
-                seen_hashes.add(ih)
-                unseen_in_page += 1
-                if ih in self._hinted_hashes:
-                    hinted_in_page += 1
-                    continue
-                existing_ct = item.get("contentType")
-                if existing_ct is not None and str(existing_ct).strip().lower() not in ("", "unknown"):
-                    continue
-                if self._is_sourceless_synthetic_row(item):
-                    continue
-                existing_tags = t_obj.get("tagNames") or []
-                inferred_ct = self._infer_content_type_from_tags(existing_tags)
-                if inferred_ct is None:
-                    continue
-                hint = self.build_import_hint(
-                    ih,
-                    str(t_obj.get("name") or item.get("title") or ""),
-                    int(t_obj.get("size") or item.get("size") or 0),
-                    inferred_ct,
+        for tag in category_tags:
+            offset = 0
+            pages = 0
+            has_next = False
+            while pages < max_scan_pages:
+                search_input: Dict[str, Any] = {
+                    "limit": page_limit,
+                    "hasNextPage": True,
+                    "facets": {
+                        "contentType": {"filter": [None]},
+                        "torrentTag": {"filter": [tag]},
+                    },
+                }
+                if offset > 0:
+                    search_input["offset"] = offset
+                resp = self._transport(
+                    self.graphql_url,
+                    {"query": GRAPHQL_RECENT_TORRENTS_QUERY, "variables": {"input": search_input}},
                 )
-                if hint is not None:
-                    hints.append(hint)
-                    by_content_type[inferred_ct] = by_content_type.get(inferred_ct, 0) + 1
-                    new_in_page += 1
+                search_data = (
+                    resp.get("data", {})
+                    .get("torrentContent", {})
+                    .get("search", {})
+                ) or {}
+                raw_items = search_data.get("items") or []
+                pages += 1
 
-            raw_has_next = search_data.get("hasNextPage")
-            has_next = (len(raw_items) >= page_limit) if raw_has_next is None else bool(raw_has_next)
-            if not has_next or unseen_in_page == 0 or (new_in_page == 0 and hinted_in_page == 0):
-                has_next = False
-                break
-            offset += len(raw_items)
+                if not raw_items:
+                    has_next = False
+                    break
+
+                unseen_in_page = 0
+                hinted_in_page = 0
+                new_in_page = 0
+                for item in raw_items:
+                    t_obj = item.get("torrent") if isinstance(item.get("torrent"), Mapping) else {}
+                    ih = str(item.get("infoHash") or t_obj.get("infoHash") or "").strip().lower()
+                    if not ih or ih in seen_hashes:
+                        continue
+                    seen_hashes.add(ih)
+                    unseen_in_page += 1
+                    if ih in self._hinted_hashes:
+                        hinted_in_page += 1
+                        continue
+                    existing_ct = item.get("contentType")
+                    if existing_ct is not None and str(existing_ct).strip().lower() not in ("", "unknown"):
+                        continue
+                    if self._is_sourceless_synthetic_row(item):
+                        continue
+                    existing_tags = t_obj.get("tagNames") or []
+                    inferred_ct = self._infer_content_type_from_tags(existing_tags)
+                    if inferred_ct is None:
+                        continue
+                    hint = self.build_import_hint(
+                        ih,
+                        str(t_obj.get("name") or item.get("title") or ""),
+                        int(t_obj.get("size") or item.get("size") or 0),
+                        inferred_ct,
+                    )
+                    if hint is not None:
+                        hints.append(hint)
+                        by_content_type[inferred_ct] = by_content_type.get(inferred_ct, 0) + 1
+                        new_in_page += 1
+
+                raw_has_next = search_data.get("hasNextPage")
+                has_next = (len(raw_items) >= page_limit) if raw_has_next is None else bool(raw_has_next)
+                if not has_next or unseen_in_page == 0 or (new_in_page == 0 and hinted_in_page == 0):
+                    has_next = False
+                    break
+                offset += len(raw_items)
+
+            if has_next:
+                complete = False
 
         submitted = 0
         if apply_mutations and hints:
@@ -1502,7 +1513,7 @@ class BitmagnetConnector(ClassifierConnector):
             "repairedCount": len(hints),
             "submittedCount": submitted,
             "byContentType": by_content_type,
-            "complete": not has_next,
+            "complete": complete,
             "importHints": hints,
         }
 
@@ -1735,18 +1746,22 @@ def main() -> None:
                 if repair_res.get("complete", True):
                     legacy_repair_done = True
             if not content_type_repair_done:
-                ct_res = connector.repair_unknown_content_types(
-                    limit=max(100, batch_size),
-                    apply_mutations=True,
-                )
-                if ct_res["repairedCount"] > 0:
-                    print(
-                        f"[bitmagnet-connector] backfilled {ct_res['repairedCount']} "
-                        f"unknown contentType hints ({ct_res['byContentType']})",
-                        flush=True,
+                try:
+                    ct_res = connector.repair_unknown_content_types(
+                        limit=max(100, batch_size),
+                        apply_mutations=True,
                     )
-                if ct_res.get("complete", True):
-                    content_type_repair_done = True
+                    if ct_res["repairedCount"] > 0:
+                        print(
+                            f"[bitmagnet-connector] backfilled {ct_res['repairedCount']} "
+                            f"unknown contentType hints ({ct_res['byContentType']})",
+                            flush=True,
+                        )
+                    if ct_res.get("complete", True):
+                        content_type_repair_done = True
+                except Exception as exc:
+                    # A failed repair must not starve classification; retry next cycle.
+                    print(f"[bitmagnet-connector] contentType repair error: {exc}", file=sys.stderr, flush=True)
             connector.sync_once(limit=batch_size, apply_mutations=True)
         except Exception as exc:
             print(f"[bitmagnet-connector] poll error: {exc}", file=sys.stderr, flush=True)
