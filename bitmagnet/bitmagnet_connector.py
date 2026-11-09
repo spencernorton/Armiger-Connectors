@@ -771,6 +771,7 @@ class BitmagnetConnector(ClassifierConnector):
         allow_english_subs: bool = True,
         reject_dead_swarms: bool = True,
         max_seen_cache: int = 50_000,
+        graphql_timeout: float = 10.0,
     ) -> None:
         self.classifier = classifier
         self.graphql_url = graphql_url
@@ -781,7 +782,9 @@ class BitmagnetConnector(ClassifierConnector):
             self.import_url = graphql_url.rstrip("/")[: -len("/graphql")] + "/import"
         else:
             self.import_url = graphql_url.rstrip("/") + "/import"
-        self._transport = graphql_transport or self._default_graphql_transport
+        self._transport = graphql_transport or (
+            lambda url, payload: self._default_graphql_transport(url, payload, timeout=graphql_timeout)
+        )
         if import_transport is not None:
             self._import_transport = import_transport
         elif graphql_transport is None:
@@ -1681,6 +1684,9 @@ def main() -> None:
     upstream_torznab_url = os.environ.get("UPSTREAM_TORZNAB_URL", "http://localhost:3333/torznab")
     poll_interval = float(os.environ.get("BITMAGNET_POLL_SECONDS", "5.0"))
     batch_size = int(os.environ.get("BITMAGNET_BATCH_SIZE", "100"))
+    graphql_timeout = float(os.environ.get("BITMAGNET_GRAPHQL_TIMEOUT_SECONDS", "10"))
+    if not 0 < graphql_timeout < float("inf"):  # also rejects nan
+        raise SystemExit("BITMAGNET_GRAPHQL_TIMEOUT_SECONDS must be a positive number of seconds")
     mode = os.environ.get("ARMIGER_CONNECTOR_MODE", "both").strip().lower()
 
     clf = load_armiger_classifier(model_dir, variant=variant, auto_download=auto_download)
@@ -1697,6 +1703,7 @@ def main() -> None:
         require_english_audio=os.environ.get("ARMIGER_REQUIRE_ENGLISH_AUDIO", "false").lower() == "true",
         allow_english_subs=os.environ.get("ARMIGER_ALLOW_ENGLISH_SUBS", "true").lower() == "true",
         reject_dead_swarms=os.environ.get("ARMIGER_REJECT_DEAD_SWARMS", "true").lower() == "true",
+        graphql_timeout=graphql_timeout,
     )
 
     host = os.environ.get("ARMIGER_CONNECTOR_HOST") or os.environ.get("ARMIGER_BRIDGE_HOST") or "0.0.0.0"
@@ -1725,7 +1732,7 @@ def main() -> None:
 
     print(
         f"Armiger Bitmagnet poller connected to {graphql_url} "
-        f"(variant={variant}, interval={poll_interval}s, batch={batch_size})",
+        f"(variant={variant}, interval={poll_interval}s, batch={batch_size}, timeout={graphql_timeout}s)",
         flush=True,
     )
     legacy_repair_done = False
