@@ -46,7 +46,7 @@ class SyntheticArmigerClassifier:
             honeypot = False
             viability_tier = "alive_viable" if seeders > 0 else "dead"
 
-            if "s01e" in name or "season" in name:
+            if any(tok in name for tok in ("s01e", "s02e", "s03e", "s01.", "s02.", "s03.", "season")):
                 category = "tv_show"
             elif "goldberg" in name or "flac" in name:
                 category = "music"
@@ -1462,3 +1462,441 @@ def test_http_servers_reject_malformed_json_post_bodies() -> None:
         bm_srv.server_close()
         rs_srv.shutdown()
         rs_srv.server_close()
+
+
+
+def test_release_matches_expected_titles_and_season_episode_boundaries() -> None:
+    """Title and season/episode helpers must admit genuine show releases while rejecting homonyms, substrings, and wrong episodes."""
+    from bitmagnet_connector import _release_matches_expected_titles, _title_matches_season_ep
+
+    assert _release_matches_expected_titles(
+        "The.Lantern.S03E01.1080p.WEB.H264",
+        ["The Lantern"],
+        expected_year=2022,
+        is_tv=True,
+        season="3",
+    ) is True
+    assert _release_matches_expected_titles(
+        "www.OpenIndex.org - The.Lantern.S03E01.1080p.WEBRip",
+        ["The Lantern"],
+        expected_year=2022,
+        is_tv=True,
+        season="3",
+    ) is True
+    assert _release_matches_expected_titles(
+        "【OpenSub】The.Lantern.S03E01.1080p.WEBRip",
+        ["The Lantern"],
+        expected_year=2022,
+        is_tv=True,
+        season="3",
+    ) is True
+    assert _release_matches_expected_titles(
+        "Red.Lantern.S02E01.1080p.WEB",
+        ["The Red Lantern"],
+        expected_year=2021,
+        is_tv=True,
+        season="2",
+    ) is True
+
+    # Different show containing the target show title must NOT match
+    assert _release_matches_expected_titles(
+        "Babies.and.the.Lantern.S03E01.1080p.WEB",
+        ["The Lantern"],
+        expected_year=2022,
+        is_tv=True,
+        season="3",
+    ) is False
+    assert _release_matches_expected_titles(
+        "Game.of.Crowns.S03E07.The.Lantern.and.the.Maiden.1080p.BluRay",
+        ["The Lantern"],
+        expected_year=2022,
+        is_tv=True,
+        season="3",
+    ) is False
+    assert _release_matches_expected_titles(
+        "Home.Solitude.2017.S01E01.1080p.WEB",
+        ["Solitude"],
+        expected_year=2015,
+        is_tv=True,
+        season="1",
+    ) is False
+    assert _release_matches_expected_titles(
+        "Solitude.Australia.S01E01.1080p.WEB",
+        ["Solitude"],
+        expected_year=2015,
+        is_tv=True,
+        season="1",
+    ) is False
+    # Same-title remake from a different year on Season 1 must NOT match
+    assert _release_matches_expected_titles(
+        "Solitude.2023.S01E01.1080p.WEB",
+        ["Solitude"],
+        expected_year=2015,
+        is_tv=True,
+        season="1",
+    ) is False
+    # Later season airing years after premiere year DOES match
+    assert _release_matches_expected_titles(
+        "Solitude.2025.S11E01.1080p.WEB",
+        ["Solitude"],
+        expected_year=2015,
+        is_tv=True,
+        season="11",
+    ) is True
+
+    # Season/episode boundary checks
+    assert _title_matches_season_ep("The.Lantern.S03E01.1080p.WEB", season="3", ep="1") is True
+    assert _title_matches_season_ep("The.Lantern.S03E01E02.1080p.WEB", season="3", ep="2") is True
+    assert _title_matches_season_ep("The.Lantern.S03.COMPLETE.1080p.WEB", season="3", ep="1") is True
+    assert _title_matches_season_ep("The.Lantern.Season.03.1080p.WEB", season="3", ep="4") is True
+    assert _title_matches_season_ep("The.Lantern.S03E10.1080p.WEB", season="3", ep="1") is False
+    assert _title_matches_season_ep("The.Lantern.S10E01.1080p.WEB", season="1", ep="1") is False
+    assert _title_matches_season_ep("The.Lantern.S03E02.1080p.WEB", season="3", ep="1") is False
+
+
+def test_bitmagnet_torznab_proxy_id_search_rescues_unlinked_items_for_imdb_tmdb_tvdb() -> None:
+    """ID searches (`imdbid`, `tmdbid`, `tvdbid`) must resolve the show/movie via GraphQL, keep linked items first, rescue matching unlinked items, and exclude other shows or wrong episodes."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import urllib.parse
+    from bitmagnet_connector import TORZNAB_NS
+
+    linked_s01e02 = """
+    <item>
+      <title>The.Lantern.S01E02.720p.HDTV</title>
+      <guid>1111111111111111111111111111111111111111</guid>
+      <category>TV show</category>
+      <size>900000000</size>
+      <torznab:attr name="infohash" value="1111111111111111111111111111111111111111"/>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="seeders" value="14"/>
+      <torznab:attr name="peers" value="16"/>
+    </item>"""
+
+    unlinked_unknown_s01e02 = """
+    <item>
+      <title>The.Lantern.S01E02.1080p.WEBRip</title>
+      <guid>2222222222222222222222222222222222222222</guid>
+      <category>Unknown</category>
+      <size>1800000000</size>
+      <torznab:attr name="infohash" value="2222222222222222222222222222222222222222"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="42"/>
+      <torznab:attr name="peers" value="46"/>
+    </item>"""
+
+    # Unlinked item whose contentType was already set to TV show (5000) by Armiger /import hints, with contentId=None
+    unlinked_armiger_typed_s01_pack = """
+    <item>
+      <title>www.OpenIndex.org - The.Lantern.S01.COMPLETE.1080p.WEB</title>
+      <guid>3333333333333333333333333333333333333333</guid>
+      <category>TV show</category>
+      <size>8400000000</size>
+      <torznab:attr name="infohash" value="3333333333333333333333333333333333333333"/>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="seeders" value="28"/>
+      <torznab:attr name="peers" value="31"/>
+    </item>"""
+
+    other_show_s01e02 = """
+    <item>
+      <title>Babies.and.the.Lantern.S01E02.1080p.WEB</title>
+      <guid>4444444444444444444444444444444444444444</guid>
+      <category>Unknown</category>
+      <size>1400000000</size>
+      <torznab:attr name="infohash" value="4444444444444444444444444444444444444444"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="35"/>
+      <torznab:attr name="peers" value="39"/>
+    </item>"""
+
+    wrong_ep_s01e09 = """
+    <item>
+      <title>The.Lantern.S01E09.1080p.WEBRip</title>
+      <guid>5555555555555555555555555555555555555555</guid>
+      <category>Unknown</category>
+      <size>1650000000</size>
+      <torznab:attr name="infohash" value="5555555555555555555555555555555555555555"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="19"/>
+      <torznab:attr name="peers" value="22"/>
+    </item>"""
+
+    # Homonym item linked in Bitmagnet to a DIFFERENT show (contentId="999888") -> must NOT be rescued
+    homonym_linked_other_id = """
+    <item>
+      <title>The.Lantern.S01E02.2160p.WEB</title>
+      <guid>6666666666666666666666666666666666666666</guid>
+      <category>TV show</category>
+      <size>4600000000</size>
+      <torznab:attr name="infohash" value="6666666666666666666666666666666666666666"/>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="seeders" value="50"/>
+      <torznab:attr name="peers" value="55"/>
+    </item>"""
+
+    unlinked_s03e01 = """
+    <item>
+      <title>The.Lantern.S03E01.1080p.WEBRip</title>
+      <guid>7777777777777777777777777777777777777777</guid>
+      <category>Unknown</category>
+      <size>1900000000</size>
+      <torznab:attr name="infohash" value="7777777777777777777777777777777777777777"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="33"/>
+      <torznab:attr name="peers" value="37"/>
+    </item>"""
+
+    linked_movie = """
+    <item>
+      <title>Sintel.2010.1080p.BluRay</title>
+      <guid>8888888888888888888888888888888888888888</guid>
+      <category>Movie</category>
+      <size>3800000000</size>
+      <torznab:attr name="infohash" value="8888888888888888888888888888888888888888"/>
+      <torznab:attr name="category" value="2000"/>
+      <torznab:attr name="seeders" value="27"/>
+      <torznab:attr name="peers" value="30"/>
+    </item>"""
+
+    unlinked_movie_4k = """
+    <item>
+      <title>Sintel.2010.2160p.UHD.BluRay</title>
+      <guid>9999999999999999999999999999999999999999</guid>
+      <category>Unknown</category>
+      <size>9200000000</size>
+      <torznab:attr name="infohash" value="9999999999999999999999999999999999999999"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="44"/>
+      <torznab:attr name="peers" value="49"/>
+    </item>"""
+
+    unlinked_movie_wrong_year = """
+    <item>
+      <title>Sintel.2022.1080p.WEBRip</title>
+      <guid>aaaa000000000000000000000000000000000001</guid>
+      <category>Unknown</category>
+      <size>2100000000</size>
+      <torznab:attr name="infohash" value="aaaa000000000000000000000000000000000001"/>
+      <torznab:attr name="category" value="8000"/>
+      <torznab:attr name="seeders" value="18"/>
+      <torznab:attr name="peers" value="21"/>
+    </item>"""
+
+    def _wrap_rss(items_xml: str, offset: int = 0) -> bytes:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">'
+            f'<channel><title>Bitmagnet</title><torznab:response offset="{offset}"/>{items_xml}</channel></rss>'
+        ).encode("utf-8")
+
+    class UpstreamBitmagnetHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            t_val = (params.get("t") or ["search"])[0].lower()
+            tmdbid = (params.get("tmdbid") or [""])[0]
+            tvdbid = (params.get("tvdbid") or [""])[0]
+            imdbid = (params.get("imdbid") or [""])[0]
+            season = (params.get("season") or [""])[0]
+            ep = (params.get("ep") or [""])[0]
+            q_val = (params.get("q") or [""])[0].lower()
+
+            if t_val == "tvsearch" and (tmdbid == "136315" or tvdbid == "403294" or imdbid in ("tt14452776", "14452776")):
+                if (season == "1" and ep == "2") or (not season and not ep):
+                    body = _wrap_rss(linked_s01e02)
+                else:
+                    # e.g. S03E01 has zero linked torrents in Bitmagnet
+                    body = _wrap_rss("")
+            elif t_val == "movie" and imdbid in ("tt1234567", "1234567"):
+                body = _wrap_rss(linked_movie)
+            elif t_val == "tvsearch" and tmdbid == "9999999":
+                body = _wrap_rss("")
+            elif t_val == "search" and "lantern" in q_val:
+                body = _wrap_rss(
+                    linked_s01e02
+                    + unlinked_unknown_s01e02
+                    + unlinked_armiger_typed_s01_pack
+                    + other_show_s01e02
+                    + wrong_ep_s01e09
+                    + homonym_linked_other_id
+                    + unlinked_s03e01
+                )
+            elif t_val == "search" and "sintel" in q_val:
+                body = _wrap_rss(linked_movie + unlinked_movie_4k + unlinked_movie_wrong_year + unlinked_unknown_s01e02)
+            else:
+                body = _wrap_rss("")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+    graphql_rows = [
+        {
+            "infoHash": "1111111111111111111111111111111111111111",
+            "contentType": "tv_show",
+            "contentSource": "tmdb",
+            "contentId": "136315",
+            "content": {
+                "title": "The Lantern",
+                "originalTitle": "The Lantern",
+                "releaseYear": 2022,
+                "attributes": [
+                    {"source": "imdb", "key": "id", "value": "tt14452776"},
+                    {"source": "tvdb", "key": "id", "value": "403294"},
+                ],
+            },
+        },
+        {
+            "infoHash": "3333333333333333333333333333333333333333",
+            "contentType": "tv_show",
+            "contentSource": None,
+            "contentId": None,
+            "content": None,
+        },
+        {
+            "infoHash": "6666666666666666666666666666666666666666",
+            "contentType": "tv_show",
+            "contentSource": "tmdb",
+            "contentId": "999888",
+            "content": {
+                "title": "The Lantern",
+                "originalTitle": "The Lantern",
+                "releaseYear": 2011,
+                "attributes": [],
+            },
+        },
+        {
+            "infoHash": "8888888888888888888888888888888888888888",
+            "contentType": "movie",
+            "contentSource": "tmdb",
+            "contentId": "45745",
+            "content": {
+                "title": "Sintel",
+                "originalTitle": "Sintel",
+                "releaseYear": 2010,
+                "attributes": [
+                    {"source": "imdb", "key": "id", "value": "tt1234567"},
+                ],
+            },
+        },
+    ]
+
+    def fake_graphql(url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        inp = (payload.get("variables") or {}).get("input") or {}
+        req_hashes = set(inp.get("infoHashes") or [])
+        q_str = str(inp.get("queryString") or "").strip('"').lower()
+        if req_hashes:
+            items = [r for r in graphql_rows if r["infoHash"] in req_hashes]
+        elif q_str:
+            items = [
+                r for r in graphql_rows
+                if r.get("content")
+                and any(q_str == str(a.get("value") or "").lower() for a in (r["content"].get("attributes") or []))
+            ]
+        else:
+            items = []
+        return {"data": {"torrentContent": {"search": {"items": items}}}}
+
+    upstream_srv = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamBitmagnetHandler)
+    upstream_port = upstream_srv.server_address[1]
+    threading.Thread(target=upstream_srv.serve_forever, daemon=True).start()
+
+    connector = BitmagnetConnector(
+        SyntheticArmigerClassifier(),
+        graphql_url="http://bitmagnet:3333/graphql",
+        upstream_torznab_url=f"http://127.0.0.1:{upstream_port}/torznab",
+        graphql_transport=fake_graphql,
+    )
+    proxy_srv = create_bitmagnet_server(connector, host="127.0.0.1", port=0)
+    proxy_port = proxy_srv.server_address[1]
+    threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+    try:
+        # 1. tmdbid + season/ep: linked item first, followed by Unknown unlinked item AND Armiger-typed unlinked pack;
+        #    other show, wrong episode, and homonym linked to different ID are all excluded.
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000,5040&tmdbid=136315&season=1&ep=2",
+            timeout=5.0,
+        ) as resp:
+            xml_bytes = resp.read()
+        items = ET.fromstring(xml_bytes).findall("./channel/item")
+        titles = [it.findtext("title") for it in items]
+        assert titles == [
+            "The.Lantern.S01E02.720p.HDTV",
+            "The.Lantern.S01E02.1080p.WEBRip",
+            "www.OpenIndex.org - The.Lantern.S01.COMPLETE.1080p.WEB",
+        ]
+        # Rescued Unknown item is promoted to category 5000
+        assert items[1].findtext("category") == "TV show"
+        assert any(
+            a.attrib.get("name") == "category" and a.attrib.get("value") == "5000"
+            for a in items[1].findall(f"{{{TORZNAB_NS}}}attr")
+        )
+
+        # 2. Pagination across linked -> unlinked preserves linked-first ordering
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000,5040&tmdbid=136315&season=1&ep=2&limit=2&offset=0",
+            timeout=5.0,
+        ) as resp:
+            page0_titles = [it.findtext("title") for it in ET.fromstring(resp.read()).findall("./channel/item")]
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000,5040&tmdbid=136315&season=1&ep=2&limit=2&offset=1",
+            timeout=5.0,
+        ) as resp:
+            page1_root = ET.fromstring(resp.read())
+            page1_titles = [it.findtext("title") for it in page1_root.findall("./channel/item")]
+            resp_node = page1_root.find(f"./channel/{{{TORZNAB_NS}}}response")
+            assert resp_node is not None and resp_node.attrib.get("offset") == "1"
+        assert page0_titles == [
+            "The.Lantern.S01E02.720p.HDTV",
+            "The.Lantern.S01E02.1080p.WEBRip",
+        ]
+        assert page1_titles == [
+            "The.Lantern.S01E02.1080p.WEBRip",
+            "www.OpenIndex.org - The.Lantern.S01.COMPLETE.1080p.WEB",
+        ]
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000,5040&tmdbid=136315&season=1&ep=2&limit=2&offset=2",
+            timeout=5.0,
+        ) as resp:
+            page2_titles = [it.findtext("title") for it in ET.fromstring(resp.read()).findall("./channel/item")]
+        assert page2_titles == [
+            "www.OpenIndex.org - The.Lantern.S01.COMPLETE.1080p.WEB",
+        ]
+
+        # 3. tvdbid search on S03E01 where primary ID search returns 0 items (only S01 is linked in Bitmagnet)
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000&tvdbid=403294&season=3&ep=1",
+            timeout=5.0,
+        ) as resp:
+            tvdb_titles = [it.findtext("title") for it in ET.fromstring(resp.read()).findall("./channel/item")]
+        assert tvdb_titles == ["The.Lantern.S03E01.1080p.WEBRip"]
+
+        # 4. Movie imdbid (numeric without tt prefix) rescues matching year movie, excludes wrong year and TV
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=movie&cat=2000&imdbid=1234567",
+            timeout=5.0,
+        ) as resp:
+            movie_titles = [it.findtext("title") for it in ET.fromstring(resp.read()).findall("./channel/item")]
+        assert movie_titles == [
+            "Sintel.2010.1080p.BluRay",
+            "Sintel.2010.2160p.UHD.BluRay",
+        ]
+
+        # 5. Unknown external ID resolves to no show -> preserves today's empty primary response
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{proxy_port}/torznab?t=tvsearch&cat=5000&tmdbid=9999999&season=1&ep=1",
+            timeout=5.0,
+        ) as resp:
+            unknown_items = ET.fromstring(resp.read()).findall("./channel/item")
+        assert unknown_items == []
+    finally:
+        proxy_srv.shutdown()
+        proxy_srv.server_close()
+        upstream_srv.shutdown()
+        upstream_srv.server_close()
