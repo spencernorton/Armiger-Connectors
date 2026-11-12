@@ -95,6 +95,31 @@ query ArmigerRecentTorrents($input: TorrentContentSearchQueryInput!) {
 }
 """.strip()
 
+GRAPHQL_RESOLVE_CONTENT_QUERY = """
+query ArmigerResolveContent($input: TorrentContentSearchQueryInput!) {
+  torrentContent {
+    search(input: $input) {
+      items {
+        infoHash
+        contentType
+        contentSource
+        contentId
+        content {
+          title
+          originalTitle
+          releaseYear
+          attributes {
+            source
+            key
+            value
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
 GRAPHQL_TORRENT_FILES_QUERY = """
 query ArmigerTorrentFiles($input: TorrentFilesQueryInput!) {
   torrent {
@@ -548,6 +573,155 @@ def _torznab_item_dedup_key(item_elem: ET.Element) -> str:
     return f"title:{title}"
 
 
+_LEADING_ARTICLES = frozenset({"the", "a", "an", "le", "la", "les", "el", "il"})
+_EXT_ID_TORZNAB_ATTRS = frozenset({"imdb", "imdbid", "tmdb", "tmdbid", "tvdb", "tvdbid"})
+_SITE_NOISE_PREFIX_RE = re.compile(
+    r"^\s*(?:\[\s*)?(?:www\.)?[a-z0-9][a-z0-9-]*\.(?:com|net|org|info|biz|me|tv|cc|to|io|xyz|club|se|eu|nz|link|app|us|uk|co)\b(?:\s*\])?[\s._]*-+[\s._]*",
+    re.IGNORECASE,
+)
+_CJK_OR_GROUP_PREFIX_RE = re.compile(r"^\s*(?:【[^】]+】[\s._-]*|\[[^\]]+\][\s._]+)")
+_RELEASE_CUT_RE = re.compile(
+    r"(?i)(?:^|[\s._\-\[\(])(?:"
+    r"s\d{1,4}(?:[\s._-]*e\d{1,4}|[\s._\-]*s\d{1,4}|$|[\s._\-\]\)])"
+    r"|season[\s._-]*\d{1,4}\b"
+    r"|\d{1,2}x\d{1,3}\b"
+    r"|complete[\s._-]*(?:series|season)\b"
+    r"|(?:2160|1440|1080|720|576|540|480|360)[pi]\b"
+    r"|(?:web[\s._-]*dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv|remux|uhd)\b"
+    r"|(?:x264|x265|hevc|h[\s._]?264|h[\s._]?265|av1|xvid)\b"
+    r")"
+)
+_TRAILING_YEAR_RE = re.compile(r"^(.*\S)[\s._\-\(\[]+((?:19|20)\d{2})[\)\]]*\s*$")
+_EXPLICIT_EPISODE_RE = re.compile(r"(?i)(?:^|[\s._\-\[\(])(?:s\d+[\s._-]*e\d+|\d{1,2}x\d{1,3})(?!\d)")
+
+
+def _torznab_item_infohash(item_elem: ET.Element) -> str:
+    for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr"):
+        if (attr.attrib.get("name") or "").strip().lower() == "infohash":
+            ih = (attr.attrib.get("value") or "").strip().lower()
+            if len(ih) == 40 and all(c in "0123456789abcdef" for c in ih):
+                return ih
+    guid = (item_elem.findtext("guid") or "").strip().lower()
+    if len(guid) == 40 and all(c in "0123456789abcdef" for c in guid):
+        return guid
+    return ""
+
+
+def _torznab_item_has_external_id(item_elem: ET.Element) -> bool:
+    for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr"):
+        name = (attr.attrib.get("name") or "").strip().lower()
+        val = (attr.attrib.get("value") or "").strip()
+        if name in _EXT_ID_TORZNAB_ATTRS and val and val not in ("0", "tt0"):
+            return True
+    return False
+
+
+def _torznab_item_matches_allowed_categories(
+    item_elem: ET.Element,
+    allowed_category_ids: Optional[set[int]],
+) -> bool:
+    if allowed_category_ids is None:
+        return True
+    cat_vals = [
+        (attr.attrib.get("value") or "").strip()
+        for attr in item_elem.findall(f"{{{TORZNAB_NS}}}attr")
+        if (attr.attrib.get("name") or "").strip().lower() == "category"
+    ]
+    parsed = parse_requested_torznab_categories("", [v for v in cat_vals if v.isdigit()])
+    if parsed:
+        return bool(parsed & allowed_category_ids)
+    cat_text = (item_elem.findtext("category") or "").strip().lower()
+    if "tv" in cat_text:
+        return 5000 in allowed_category_ids
+    if "movie" in cat_text:
+        return 2000 in allowed_category_ids
+    return False
+
+
+def _strict_title_key(text: str) -> str:
+    cleaned = str(text or "").replace("'", "").replace("’", "").replace("`", "")
+    cleaned = cleaned.replace("&", " and ")
+    tokens = re.findall(r"[a-z0-9]+", cleaned.lower())
+    return " ".join(tokens)
+
+
+def _family_title_key(text: str) -> str:
+    tokens = _strict_title_key(text).split()
+    if len(tokens) > 1 and tokens[0] in _LEADING_ARTICLES:
+        tokens = tokens[1:]
+    return " ".join(tokens)
+
+
+def _extract_release_base_title_and_year(release_name: str) -> Tuple[str, Optional[int]]:
+    s = str(release_name or "").strip()
+    for _ in range(3):
+        m_site = _SITE_NOISE_PREFIX_RE.match(s)
+        if not m_site:
+            break
+        s = s[m_site.end():]
+    m_grp = _CJK_OR_GROUP_PREFIX_RE.match(s)
+    if m_grp and m_grp.end() < len(s):
+        s = s[m_grp.end():]
+    # Remove CJK prefix before dotted Latin title if present
+    s = re.sub(r"^[\u3000-\u9fff\uff00-\uffef\[\]0-9\s._-]+(?=[A-Za-z])", "", s)
+    cut = _RELEASE_CUT_RE.search(s)
+    head = s[: cut.start()] if cut and cut.start() > 0 else s
+    head = head.strip(" ._-[]()")
+    year: Optional[int] = None
+    ym = _TRAILING_YEAR_RE.match(head)
+    if ym:
+        candidate_base = ym.group(1).strip(" ._-[]()")
+        if _strict_title_key(candidate_base):
+            head = candidate_base
+            year = int(ym.group(2))
+    return head, year
+
+
+def _release_matches_expected_titles(
+    release_name: str,
+    expected_titles: Sequence[str],
+    *,
+    expected_year: Optional[int] = None,
+    is_tv: bool = False,
+    season: Optional[str] = None,
+) -> bool:
+    base_title, parsed_year = _extract_release_base_title_and_year(release_name)
+    cand_strict = _strict_title_key(base_title)
+    if not cand_strict:
+        return False
+    cand_family = _family_title_key(base_title)
+
+    strict_targets: set[str] = set()
+    multi_word_family_targets: set[str] = set()
+    for raw in expected_titles:
+        st = _strict_title_key(raw)
+        if st:
+            strict_targets.add(st)
+        fk = _family_title_key(raw)
+        if fk and " " in fk:
+            multi_word_family_targets.add(fk)
+
+    if cand_strict not in strict_targets and cand_family not in multi_word_family_targets:
+        return False
+
+    if expected_year is not None and parsed_year is not None:
+        diff = parsed_year - expected_year
+        if is_tv:
+            if diff < -1:
+                return False
+            s_clean = (season or "").strip()
+            s_is_one = (s_clean.isdigit() and int(s_clean) == 1) or bool(
+                re.search(r"(?i)(?:^|[\s._\-\[\(])(?:s0*1(?!\d)|season[\s._-]*0*1(?!\d)|0*1x\d+)", release_name)
+                and not re.search(r"(?i)s0*1[\s._-]*s0*[2-9]", release_name)
+            )
+            if s_is_one and abs(diff) > 1:
+                return False
+        else:
+            if abs(diff) > 1:
+                return False
+    return True
+
+
 def _title_matches_season_ep(
     title: str, season: Optional[str] = None, ep: Optional[str] = None
 ) -> bool:
@@ -558,12 +732,18 @@ def _title_matches_season_ep(
     if s_num is None and e_num is None:
         return True
     if s_num is not None and e_num is not None:
-        pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}[\s._-]*e0*{e_num}|0*{s_num}x0*{e_num})(?:$|[\s._\-\]\)a-z])"
-        return bool(re.search(pat, title))
+        pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}(?:[\s._\-]*e\d+)*[\s._\-]*e0*{e_num}|0*{s_num}x0*{e_num})(?!\d)"
+        if re.search(pat, title):
+            return True
+        # Whole-season pack for season `s_num` (no episode number marker) satisfies episode queries.
+        season_pack_pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}(?:$|[\s._\-\]\)])|season[\s._\-]*0*{s_num}(?:$|[\s._\-\]\)]))"
+        if re.search(season_pack_pat, title) and not _EXPLICIT_EPISODE_RE.search(title):
+            return True
+        return False
     if s_num is not None:
-        pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}(?:[\s._-]*e\d+|$|[\s._\-\]\)])|season[\s._-]*0*{s_num}(?:$|[\s._\-\]\)])|0*{s_num}x\d+)"
+        pat = rf"(?i)(?:^|[\s._\-\[\(])(?:s0*{s_num}(?!\d)|season[\s._\-]*0*{s_num}(?!\d)|0*{s_num}x\d+)"
         return bool(re.search(pat, title))
-    pat = rf"(?i)(?:^|[\s._\-\[\(])(?:e0*{e_num}|ep(?:isode)?[\s._-]*0*{e_num}|-\s*0*{e_num})(?:$|[\s._\-\]\)])"
+    pat = rf"(?i)(?:^|[\s._\-\[\(])(?:e0*{e_num}|ep(?:isode)?[\s._\-]*0*{e_num}|-\s*0*{e_num})(?!\d)"
     return bool(re.search(pat, title))
 
 
@@ -573,8 +753,13 @@ def merge_unclassified_torznab_items(
     *,
     season: Optional[str] = None,
     ep: Optional[str] = None,
+    expected_titles: Optional[Sequence[str]] = None,
+    expected_year: Optional[int] = None,
+    is_tv: bool = False,
+    allowed_category_ids: Optional[set[int]] = None,
+    linked_hash_lookup: Optional[Callable[[Sequence[str]], set[str]]] = None,
 ) -> Tuple[bytes, set[str]]:
-    """Append unclassified (`Unknown` / `8000`) items from `fallback_xml` not already in `primary_xml`."""
+    """Append unlinked (`Unknown` / `8000`, or unlinked typed on ID searches) items from `fallback_xml`."""
     try:
         primary_root = ET.fromstring(primary_xml)
         fallback_root = ET.fromstring(fallback_xml)
@@ -588,23 +773,83 @@ def merge_unclassified_torznab_items(
     existing_keys = {
         _torznab_item_dedup_key(it) for it in primary_channel.findall("item")
     }
-    rescued_keys: set[str] = set()
+    candidates: List[Tuple[str, ET.Element, bool, str]] = []
+    typed_hashes: List[str] = []
+
     for item in fallback_channel.findall("item"):
         key = _torznab_item_dedup_key(item)
         if not key or key in existing_keys:
             continue
-        if not is_unclassified_torznab_item(item):
-            continue
+        is_uncl = is_unclassified_torznab_item(item)
+        if expected_titles is None:
+            if not is_uncl:
+                continue
+        else:
+            if _torznab_item_has_external_id(item):
+                continue
+            if not is_uncl and not _torznab_item_matches_allowed_categories(item, allowed_category_ids):
+                continue
         title = (item.findtext("title") or "").strip()
+        if expected_titles is not None and not _release_matches_expected_titles(
+            title,
+            expected_titles,
+            expected_year=expected_year,
+            is_tv=is_tv,
+            season=season,
+        ):
+            continue
         if not _title_matches_season_ep(title, season=season, ep=ep):
             continue
+        ih = _torznab_item_infohash(item)
+        if not is_uncl and ih and ih not in typed_hashes:
+            typed_hashes.append(ih)
         existing_keys.add(key)
+        candidates.append((key, item, is_uncl, ih))
+
+    linked_hashes: set[str] = set()
+    if expected_titles is not None and typed_hashes and linked_hash_lookup is not None:
+        linked_hashes = linked_hash_lookup(typed_hashes)
+
+    rescued_keys: set[str] = set()
+    for key, item, is_uncl, ih in candidates:
+        if not is_uncl and ih and ih in linked_hashes:
+            continue
         rescued_keys.add(key)
         primary_channel.append(item)
 
     if not rescued_keys:
         return primary_xml, set()
     return ET.tostring(primary_root, encoding="utf-8", xml_declaration=True), rescued_keys
+
+
+def _slice_torznab_feed(
+    xml_bytes: bytes,
+    *,
+    offset: int = 0,
+    limit: Optional[int] = None,
+) -> Tuple[bytes, int]:
+    """Apply `offset` and `limit` to `<channel><item>` elements while preserving channel order."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return xml_bytes, 0
+    channel = root.find("channel")
+    if channel is None:
+        return xml_bytes, 0
+    items = channel.findall("item")
+    start = max(0, int(offset))
+    end = len(items) if limit is None else start + max(0, int(limit))
+    kept = items[start:end]
+    if len(kept) == len(items) and start == 0:
+        return xml_bytes, len(kept)
+    keep_ids = {id(it) for it in kept}
+    for it in items:
+        if id(it) not in keep_ids:
+            channel.remove(it)
+    resp_elem = channel.find(f"{{{TORZNAB_NS}}}response")
+    if resp_elem is not None:
+        resp_elem.set("offset", str(start))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True), len(kept)
 
 
 def filter_torznab_feed(
@@ -799,9 +1044,18 @@ class BitmagnetConnector(ClassifierConnector):
         self.allow_english_subs = allow_english_subs
         self.reject_dead_swarms = reject_dead_swarms
         self.max_seen_cache = max_seen_cache
+        if (
+            graphql_url == "http://localhost:3333/graphql"
+            and graphql_transport is None
+            and self.upstream_torznab_url != "http://localhost:3333/torznab"
+            and self.upstream_torznab_url.endswith("/torznab")
+        ):
+            self.graphql_url = self.upstream_torznab_url[: -len("/torznab")] + "/graphql"
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._wave_seen: set[str] = set()
         self._hinted_hashes: OrderedDict[str, None] = OrderedDict()
+        self._id_cache_lock = threading.Lock()
+        self._id_title_cache: OrderedDict[Tuple[str, str, str, str], Tuple[float, List[str], Optional[int]]] = OrderedDict()
 
     @staticmethod
     def _default_graphql_transport(url: str, payload: Mapping[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
@@ -1562,6 +1816,241 @@ class BitmagnetConnector(ClassifierConnector):
             rescued_item_keys=rescued_item_keys,
         )
 
+
+    @staticmethod
+    def _extract_primary_infohashes(xml_bytes: bytes, max_hashes: int = 3) -> List[str]:
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return []
+        hashes: List[str] = []
+        for item in root.findall("./channel/item"):
+            ih = ""
+            for attr in item.findall(f"{{{TORZNAB_NS}}}attr"):
+                if (attr.attrib.get("name") or "").strip().lower() == "infohash":
+                    ih = (attr.attrib.get("value") or "").strip().lower()
+                    break
+            if not ih:
+                guid = (item.findtext("guid") or "").strip().lower()
+                if len(guid) == 40 and all(c in "0123456789abcdef" for c in guid):
+                    ih = guid
+            if len(ih) == 40 and ih not in hashes:
+                hashes.append(ih)
+                if len(hashes) >= max_hashes:
+                    break
+        return hashes
+
+    @staticmethod
+    def _content_item_matches_external_ids(
+        item: Mapping[str, Any],
+        expected_types: Optional[set[str]],
+        imdb_norm: str,
+        tmdb_norm: str,
+        tvdb_norm: str,
+    ) -> Optional[Tuple[List[str], Optional[int]]]:
+        content = item.get("content")
+        if not isinstance(content, Mapping):
+            return None
+        ct = str(item.get("contentType") or "").strip().lower()
+        if expected_types and ct and ct not in expected_types:
+            return None
+        c_source = str(item.get("contentSource") or "").strip().lower()
+        c_id = str(item.get("contentId") or "").strip()
+
+        matched_id = False
+        if tmdb_norm and c_source == "tmdb" and c_id == tmdb_norm:
+            matched_id = True
+        if imdb_norm and c_source == "imdb" and c_id.lower() == imdb_norm:
+            matched_id = True
+        if tvdb_norm and c_source == "tvdb" and c_id == tvdb_norm:
+            matched_id = True
+
+        if not matched_id:
+            for attr in content.get("attributes") or ():
+                if not isinstance(attr, Mapping) or str(attr.get("key") or "").strip() != "id":
+                    continue
+                a_src = str(attr.get("source") or "").strip().lower()
+                a_val = str(attr.get("value") or "").strip()
+                if imdb_norm and a_src == "imdb" and (a_val.lower() == imdb_norm or f"tt{a_val}".lower() == imdb_norm):
+                    matched_id = True
+                    break
+                if tvdb_norm and a_src == "tvdb" and a_val == tvdb_norm:
+                    matched_id = True
+                    break
+                if tmdb_norm and a_src == "tmdb" and a_val == tmdb_norm:
+                    matched_id = True
+                    break
+
+        if not matched_id:
+            return None
+
+        titles: List[str] = []
+        for field_name in ("title", "originalTitle"):
+            val = str(content.get(field_name) or "").strip()
+            if val and val not in titles:
+                titles.append(val)
+        if not titles:
+            return None
+        raw_year = content.get("releaseYear")
+        year = int(raw_year) if isinstance(raw_year, int) and raw_year > 0 else (
+            int(str(raw_year)) if str(raw_year or "").isdigit() else None
+        )
+        return titles, year
+
+    def resolve_content_by_external_ids(
+        self,
+        t_param: str,
+        *,
+        imdbid: Optional[str] = None,
+        tmdbid: Optional[str] = None,
+        tvdbid: Optional[str] = None,
+        primary_xml: Optional[bytes] = None,
+        torznab_subpath: str = "",
+        pass_params: Sequence[Tuple[str, str]] = (),
+        had_episode_filter: bool = False,
+    ) -> Tuple[List[str], Optional[int]]:
+        """Resolve external IDs (`imdbid`, `tmdbid`, `tvdbid`) to canonical titles via Bitmagnet GraphQL."""
+        t_clean = (t_param or "").strip().lower()
+        imdb_raw = (imdbid or "").strip()
+        imdb_norm = ""
+        if imdb_raw:
+            imdb_norm = f"tt{imdb_raw}" if imdb_raw.isdigit() else imdb_raw.lower()
+        tmdb_norm = (tmdbid or "").strip()
+        tvdb_norm = "" if t_clean in ("movie", "movies") else (tvdbid or "").strip()
+        if not (imdb_norm or tmdb_norm or tvdb_norm) or not self.graphql_url:
+            return [], None
+
+        cache_key = (t_clean, imdb_norm, tmdb_norm, tvdb_norm)
+        now = time.monotonic()
+        with self._id_cache_lock:
+            cached = self._id_title_cache.get(cache_key)
+            if cached is not None and (now - cached[0]) < 600.0:
+                self._id_title_cache.move_to_end(cache_key)
+                return list(cached[1]), cached[2]
+
+        expected_types: Optional[set[str]] = None
+        if t_clean in ("tvsearch", "tv"):
+            expected_types = {"tv_show"}
+        elif t_clean in ("movie", "movies"):
+            expected_types = {"movie"}
+
+        def _query_graphql(search_input: Dict[str, Any]) -> Optional[Tuple[List[str], Optional[int]]]:
+            try:
+                resp = self._transport(
+                    self.graphql_url,
+                    {"query": GRAPHQL_RESOLVE_CONTENT_QUERY, "variables": {"input": search_input}},
+                )
+            except Exception:
+                return None
+            items = (
+                ((resp or {}).get("data") or {})
+                .get("torrentContent", {})
+                .get("search", {})
+                .get("items")
+            ) or []
+            merged_titles: List[str] = []
+            resolved_year: Optional[int] = None
+            for it in items:
+                if not isinstance(it, Mapping):
+                    continue
+                found = self._content_item_matches_external_ids(
+                    it, expected_types, imdb_norm, tmdb_norm, tvdb_norm
+                )
+                if found is not None:
+                    for t_str in found[0]:
+                        if t_str not in merged_titles:
+                            merged_titles.append(t_str)
+                    if resolved_year is None and found[1] is not None:
+                        resolved_year = found[1]
+            if merged_titles:
+                return merged_titles, resolved_year
+            return None
+
+        # 1. Fast path: inspect infoHashes already returned by the primary Torznab ID call.
+        primary_hashes = self._extract_primary_infohashes(primary_xml) if primary_xml else []
+        if primary_hashes:
+            resolved = _query_graphql({"infoHashes": primary_hashes, "limit": len(primary_hashes)})
+            if resolved is not None:
+                with self._id_cache_lock:
+                    self._id_title_cache[cache_key] = (now, list(resolved[0]), resolved[1])
+                    while len(self._id_title_cache) > 512:
+                        self._id_title_cache.popitem(last=False)
+                return resolved
+
+        # 2. Search GraphQL `torrentContent` by external ID token (IMDb/TVDB attributes are in `tsv`).
+        facet_filter: Dict[str, Any] = {}
+        if expected_types and len(expected_types) == 1:
+            facet_filter = {"facets": {"contentType": {"filter": list(expected_types)}}}
+        for token in (imdb_norm, tvdb_norm, tmdb_norm):
+            if not token:
+                continue
+            safe_tok = token.replace('"', " ").strip()
+            if not safe_tok:
+                continue
+            resolved = _query_graphql({"queryString": f'"{safe_tok}"', "limit": 5, **facet_filter})
+            if resolved is not None:
+                with self._id_cache_lock:
+                    self._id_title_cache[cache_key] = (now, list(resolved[0]), resolved[1])
+                    while len(self._id_title_cache) > 512:
+                        self._id_title_cache.popitem(last=False)
+                return resolved
+
+        # 3. If the original request filtered by season/ep (so 0 linked rows matched that episode,
+        #    while another season of the show IS linked by ID in Bitmagnet), probe 1 linked row without season/ep.
+        if had_episode_filter and not primary_hashes and self.upstream_torznab_url:
+            probe_pairs = [
+                (k, v)
+                for k, v in pass_params
+                if k.lower() not in ("season", "ep", "limit", "offset", "q")
+            ]
+            probe_pairs.append(("limit", "1"))
+            probe_url = f"{self.upstream_torznab_url}{torznab_subpath}?{urllib.parse.urlencode(probe_pairs)}"
+            try:
+                req = urllib.request.Request(probe_url, method="GET")
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    probe_hashes = self._extract_primary_infohashes(resp.read(), max_hashes=1)
+                if probe_hashes:
+                    resolved = _query_graphql({"infoHashes": probe_hashes, "limit": 1})
+                    if resolved is not None:
+                        with self._id_cache_lock:
+                            self._id_title_cache[cache_key] = (now, list(resolved[0]), resolved[1])
+                            while len(self._id_title_cache) > 512:
+                                self._id_title_cache.popitem(last=False)
+                        return resolved
+            except Exception:
+                pass
+
+        return [], None
+
+    def find_linked_infohashes(self, info_hashes: Sequence[str]) -> set[str]:
+        """Return the subset of `info_hashes` that already carry a non-empty `contentId` in Bitmagnet."""
+        unique = list(dict.fromkeys(h.strip().lower() for h in info_hashes if h and len(h.strip()) == 40))
+        if not unique or not self.graphql_url:
+            return set()
+        try:
+            resp = self._transport(
+                self.graphql_url,
+                {"query": GRAPHQL_RESOLVE_CONTENT_QUERY, "variables": {"input": {"infoHashes": unique, "limit": len(unique)}}},
+            )
+        except Exception:
+            return set(unique)
+        items = (
+            ((resp or {}).get("data") or {})
+            .get("torrentContent", {})
+            .get("search", {})
+            .get("items")
+        ) or []
+        linked: set[str] = set()
+        for it in items:
+            if not isinstance(it, Mapping):
+                continue
+            ih = str(it.get("infoHash") or "").strip().lower()
+            cid = str(it.get("contentId") or "").strip()
+            if ih and cid:
+                linked.add(ih)
+        return linked
+
+
 def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: int = 8096) -> ThreadingHTTPServer:
     """Create a lightweight HTTP server exposing `/healthz`, `/v1/bitmagnet/classify`, and `/torznab`."""
 
@@ -1574,11 +2063,29 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
             parsed = urllib.parse.urlsplit(self.path)
             if parsed.path.startswith("/torznab") or parsed.path.startswith("/api"):
                 params = urllib.parse.parse_qs(parsed.query)
+                parsed_qsl = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
                 t_param = (params.get("t") or [""])[0].lower()
                 subpath = parsed.path[len("/torznab"):] if parsed.path.startswith("/torznab") else parsed.path
-                target = f"{connector.upstream_torznab_url}{subpath}"
-                if parsed.query:
-                    target = f"{target}?{parsed.query}"
+
+                imdb_val = (params.get("imdbid") or [""])[0].strip()
+                tmdb_val = (params.get("tmdbid") or [""])[0].strip()
+                tvdb_val = (params.get("tvdbid") or [""])[0].strip()
+                has_ext_id = bool(imdb_val or tmdb_val or tvdb_val)
+
+                raw_limit = (params.get("limit") or [""])[0].strip()
+                raw_offset = (params.get("offset") or [""])[0].strip()
+                req_limit = int(raw_limit) if raw_limit.isdigit() else None
+                req_offset = int(raw_offset) if raw_offset.isdigit() else 0
+
+                repage_ext_id = has_ext_id and req_offset > 0 and (req_offset + (req_limit or 100)) <= 500
+                if repage_ext_id:
+                    up_pairs = [(k, v) for k, v in parsed_qsl if k.lower() not in ("limit", "offset")]
+                    up_pairs.append(("limit", str(req_offset + (req_limit or 100))))
+                    target = f"{connector.upstream_torznab_url}{subpath}?{urllib.parse.urlencode(up_pairs)}"
+                else:
+                    target = f"{connector.upstream_torznab_url}{subpath}"
+                    if parsed.query:
+                        target = f"{target}?{parsed.query}"
                 try:
                     req = urllib.request.Request(target, method="GET")
                     with urllib.request.urlopen(req, timeout=15.0) as resp:
@@ -1594,34 +2101,87 @@ def create_server(connector: BitmagnetConnector, host: str = "127.0.0.1", port: 
                 else:
                     allowed_cat_ids = parse_requested_torznab_categories(t_param, params.get("cat"))
                     rescued_keys: set[str] = set()
-                    has_ext_id = bool(params.get("imdbid") or params.get("tmdbid"))
-                    if allowed_cat_ids is not None and 8000 not in allowed_cat_ids and not has_ext_id:
-                        fb_pairs = [
-                            (k, v)
-                            for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-                            if k.lower() not in ("t", "cat", "season", "ep")
-                        ]
-                        fb_pairs.insert(0, ("t", "search"))
-                        fb_query = urllib.parse.urlencode(fb_pairs)
-                        fb_target = f"{connector.upstream_torznab_url}{subpath}?{fb_query}"
-                        if fb_target != target:
-                            try:
-                                fb_req = urllib.request.Request(fb_target, method="GET")
-                                with urllib.request.urlopen(fb_req, timeout=15.0) as fb_resp:
-                                    fb_xml = fb_resp.read()
-                                raw_xml, rescued_keys = merge_unclassified_torznab_items(
-                                    raw_xml,
-                                    fb_xml,
-                                    season=(params.get("season") or [None])[0],
-                                    ep=(params.get("ep") or [None])[0],
-                                )
-                            except Exception:
-                                pass
+                    season_val = (params.get("season") or [None])[0]
+                    ep_val = (params.get("ep") or [None])[0]
+
+                    if allowed_cat_ids is not None and 8000 not in allowed_cat_ids:
+                        if not has_ext_id:
+                            fb_pairs = [
+                                (k, v)
+                                for k, v in parsed_qsl
+                                if k.lower() not in ("t", "cat", "season", "ep")
+                            ]
+                            fb_pairs.insert(0, ("t", "search"))
+                            fb_query = urllib.parse.urlencode(fb_pairs)
+                            fb_target = f"{connector.upstream_torznab_url}{subpath}?{fb_query}"
+                            if fb_target != target:
+                                try:
+                                    fb_req = urllib.request.Request(fb_target, method="GET")
+                                    with urllib.request.urlopen(fb_req, timeout=15.0) as fb_resp:
+                                        fb_xml = fb_resp.read()
+                                    raw_xml, rescued_keys = merge_unclassified_torznab_items(
+                                        raw_xml,
+                                        fb_xml,
+                                        season=season_val,
+                                        ep=ep_val,
+                                    )
+                                except Exception:
+                                    pass
+                        else:
+                            resolved_titles, resolved_year = connector.resolve_content_by_external_ids(
+                                t_param,
+                                imdbid=imdb_val,
+                                tmdbid=tmdb_val,
+                                tvdbid=tvdb_val,
+                                primary_xml=raw_xml,
+                                torznab_subpath=subpath,
+                                pass_params=parsed_qsl,
+                                had_episode_filter=bool(season_val or ep_val),
+                            )
+                            if resolved_titles:
+                                fb_limit = min(500, max(100, (req_limit or 100) + req_offset))
+                                fb_pairs = [
+                                    (k, v)
+                                    for k, v in parsed_qsl
+                                    if k.lower() not in (
+                                        "t", "cat", "imdbid", "tmdbid", "tvdbid",
+                                        "season", "ep", "q", "limit", "offset",
+                                    )
+                                ]
+                                fb_pairs.insert(0, ("t", "search"))
+                                fb_pairs.append(("q", resolved_titles[0]))
+                                fb_pairs.append(("limit", str(fb_limit)))
+                                fb_target = f"{connector.upstream_torznab_url}{subpath}?{urllib.parse.urlencode(fb_pairs)}"
+                                try:
+                                    fb_req = urllib.request.Request(fb_target, method="GET")
+                                    with urllib.request.urlopen(fb_req, timeout=15.0) as fb_resp:
+                                        fb_xml = fb_resp.read()
+                                    raw_xml, rescued_keys = merge_unclassified_torznab_items(
+                                        raw_xml,
+                                        fb_xml,
+                                        season=season_val,
+                                        ep=ep_val,
+                                        expected_titles=resolved_titles,
+                                        expected_year=resolved_year,
+                                        is_tv=(5000 in allowed_cat_ids),
+                                        allowed_category_ids=allowed_cat_ids,
+                                        linked_hash_lookup=connector.find_linked_infohashes,
+                                    )
+                                except Exception:
+                                    pass
+
                     out_bytes, stats = connector.filter_torznab_xml(
                         raw_xml,
                         allowed_category_ids=allowed_cat_ids,
                         rescued_item_keys=rescued_keys,
                     )
+                    if has_ext_id and (repage_ext_id or req_limit is not None):
+                        out_bytes, kept_count = _slice_torznab_feed(
+                            out_bytes,
+                            offset=req_offset if repage_ext_id else 0,
+                            limit=req_limit,
+                        )
+                        stats["admitted"] = kept_count
 
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
